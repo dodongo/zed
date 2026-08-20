@@ -30,7 +30,8 @@ use futures::{FutureExt, StreamExt, channel::oneshot, future};
 use git::GitHostingProviderRegistry;
 use git_ui::clone::clone_and_open;
 use gpui::{
-    App, AppContext, Application, AsyncApp, QuitMode, Task, TaskExt, UpdateGlobal as _, block_on,
+    App, AppContext, Application, AsyncApp, QuitMode, Task, TaskExt, UpdateGlobal as _, WindowId,
+    block_on,
 };
 use gpui_platform;
 
@@ -1419,15 +1420,43 @@ pub(crate) async fn restore_or_create_workspace(
     app_state: Arc<AppState>,
     cx: &mut AsyncApp,
 ) -> Result<()> {
+    let restore_started = cx.update(|cx| {
+        app_state
+            .session
+            .update(cx, |session, _| session.try_begin_workspace_restore())
+    });
+    if !restore_started {
+        while cx.update(|cx| app_state.session.read(cx).workspace_restore_in_progress()) {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(10))
+                .await;
+        }
+        return Ok(());
+    }
+
+    let result = restore_or_create_workspace_inner(app_state.clone(), cx).await;
+    cx.update(|cx| {
+        app_state
+            .session
+            .update(cx, |session, _| session.finish_workspace_restore());
+    });
+    result
+}
+
+async fn restore_or_create_workspace_inner(
+    app_state: Arc<AppState>,
+    cx: &mut AsyncApp,
+) -> Result<()> {
     let kvp = cx.update(|cx| KeyValueStore::global(cx));
-    if let Some(multi_workspaces) = restorable_workspaces(cx, &app_state).await {
+    if let Some((multi_workspaces, active_window_id)) = restorable_workspaces(cx, &app_state).await
+    {
         let mut error_count = 0;
+        let mut restored_windows = HashMap::default();
         for multi_workspace in multi_workspaces {
+            let old_window_id = multi_workspace.active_workspace.window_id;
             let result = match &multi_workspace.active_workspace.location {
                 SerializedWorkspaceLocation::Local => {
-                    restore_multiworkspace(multi_workspace, app_state.clone(), cx)
-                        .await
-                        .map(|_| ())
+                    restore_multiworkspace(multi_workspace, app_state.clone(), cx).await
                 }
                 SerializedWorkspaceLocation::Remote(connection_options) => {
                     let mut connection_options = connection_options.clone();
@@ -1462,16 +1491,31 @@ pub(crate) async fn restore_or_create_workspace(
                             cx,
                         )
                         .await;
-                        Ok::<(), anyhow::Error>(())
+                        Ok::<_, anyhow::Error>(window)
                     }
                     .await
                 }
             };
 
-            if let Err(error) = result {
-                log::error!("Failed to restore workspace: {error:#}");
-                error_count += 1;
+            match result {
+                Ok(window) => {
+                    if let Some(old_window_id) = old_window_id {
+                        restored_windows.insert(old_window_id, window);
+                    }
+                }
+                Err(error) => {
+                    log::error!("Failed to restore workspace: {error:#}");
+                    error_count += 1;
+                }
             }
+        }
+
+        if let Some(active_window_id) = active_window_id
+            && let Some(window) = restored_windows.get(&active_window_id)
+        {
+            window
+                .update(cx, |_, window, _cx| window.activate_window())
+                .log_err();
         }
 
         if error_count > 0 {
@@ -1577,9 +1621,19 @@ pub(crate) async fn restore_or_create_workspace(
 async fn restorable_workspaces(
     cx: &mut AsyncApp,
     app_state: &Arc<AppState>,
-) -> Option<Vec<workspace::SerializedMultiWorkspace>> {
+) -> Option<(Vec<workspace::SerializedMultiWorkspace>, Option<WindowId>)> {
+    let active_window_id = cx.update(|cx| {
+        app_state
+            .session
+            .read(cx)
+            .last_session_window_stack()
+            .and_then(|window_ids| window_ids.into_iter().next())
+    });
     let locations = restorable_workspace_locations(cx, app_state).await?;
-    Some(cx.update(|cx| workspace::read_serialized_multi_workspaces(locations, cx)))
+    Some((
+        cx.update(|cx| workspace::read_serialized_multi_workspaces(locations, cx)),
+        active_window_id,
+    ))
 }
 
 pub(crate) async fn restorable_workspace_locations(
@@ -1594,14 +1648,16 @@ pub(crate) async fn restorable_workspace_locations(
     });
 
     let session_handle = app_state.session.clone();
-    let (last_session_id, last_session_window_stack) = cx.update(|cx| {
-        let session = session_handle.read(cx);
+    let (last_session_id, last_session_window_stack, last_session_window_open_order) =
+        cx.update(|cx| {
+            let session = session_handle.read(cx);
 
-        (
-            session.last_session_id().map(|id| id.to_string()),
-            session.last_session_window_stack(),
-        )
-    });
+            (
+                session.last_session_id().map(|id| id.to_string()),
+                session.last_session_window_stack(),
+                session.last_session_window_open_order(),
+            )
+        });
 
     if last_session_id.is_none()
         && matches!(
@@ -1627,20 +1683,35 @@ pub(crate) async fn restorable_workspace_locations(
         }
         workspace::RestoreOnStartupBehavior::LastSession => {
             if let Some(last_session_id) = last_session_id {
-                let ordered = last_session_window_stack.is_some();
+                let use_open_order =
+                    cx.update(|cx| WorkspaceSettings::get(None, cx).use_system_window_tabs);
+                let window_order = if use_open_order {
+                    last_session_window_open_order.or_else(|| {
+                        last_session_window_stack.clone().map(|mut window_ids| {
+                            window_ids.sort_by_key(|window_id| window_id.as_u64());
+                            window_ids
+                        })
+                    })
+                } else {
+                    last_session_window_stack
+                };
+                let ordered = window_order.is_some();
 
                 let mut locations = workspace::last_session_workspace_locations(
                     &db,
                     &last_session_id,
-                    last_session_window_stack,
+                    window_order,
                     app_state.fs.as_ref(),
                 )
                 .await
                 .filter(|locations| !locations.is_empty());
 
-                // Since last_session_window_order returns the windows ordered front-to-back
-                // we need to open the window that was frontmost last.
-                if ordered && let Some(locations) = locations.as_mut() {
+                // Front-to-back stack order needs its frontmost window opened last.
+                // First-opened tab order is already in creation order.
+                if ordered
+                    && !use_open_order
+                    && let Some(locations) = locations.as_mut()
+                {
                     locations.reverse();
                 }
 

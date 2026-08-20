@@ -113,7 +113,7 @@ use serde::Deserialize;
 use session::AppSession;
 use settings::{
     CenteredPaddingSettings, DefaultOpenBehavior, Settings, SettingsLocation, SettingsStore,
-    update_settings_file,
+    update_settings_file, watch_config_file,
 };
 
 use sqlez::{
@@ -173,6 +173,104 @@ use crate::{
 
 pub const SERIALIZATION_THROTTLE_TIME: Duration = Duration::from_millis(200);
 pub const MAX_RECENT_SELECTIONS: usize = 20;
+const WINDOW_STATUS_PATH: &str = ".zed/window-status.json";
+const IDENTITY_EMOJI_FAMILIES: &[&[&str]] = &[
+    &["🟦", "🟪", "🟧", "🟫", "⬛"],
+    &["🔷", "🔶", "🔹", "🔸", "💠"],
+    &["⭐", "🌟", "✨", "💫", "⚡"],
+    &["🧩", "🧱", "🪩", "🔰", "🧿"],
+];
+
+fn default_new_workspace_dock_structure() -> DockStructure {
+    DockStructure {
+        left: DockData {
+            visible: true,
+            active_panel: Some("Project Panel".to_string()),
+            zoom: false,
+        },
+        right: DockData {
+            visible: true,
+            active_panel: Some("TerminalPanel".to_string()),
+            zoom: false,
+        },
+        bottom: DockData::default(),
+    }
+}
+
+fn should_apply_default_new_workspace_layout(
+    open_mode: OpenMode,
+    serialized_workspace_has_paths: bool,
+) -> bool {
+    open_mode == OpenMode::NewWindow || !serialized_workspace_has_paths
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WindowStatus {
+    emoji: String,
+}
+
+impl Default for WindowStatus {
+    fn default() -> Self {
+        Self {
+            emoji: "◯".to_string(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct WindowStatusFile {
+    state: Option<String>,
+}
+
+fn parse_window_status(contents: &str) -> WindowStatus {
+    if contents.trim().is_empty() {
+        return WindowStatus::default();
+    }
+
+    let Ok(file) = serde_json::from_str::<WindowStatusFile>(contents) else {
+        return WindowStatus {
+            emoji: "⚠️".to_string(),
+        };
+    };
+
+    match file.state.as_deref() {
+        Some("idle") | None => WindowStatus::default(),
+        Some("running") => WindowStatus {
+            emoji: "◐".to_string(),
+        },
+        Some("success") => WindowStatus {
+            emoji: "◉".to_string(),
+        },
+        Some("failure") | Some("failed") => WindowStatus {
+            emoji: "⊗".to_string(),
+        },
+        Some(_) => WindowStatus {
+            emoji: "⚠️".to_string(),
+        },
+    }
+}
+
+fn workspace_identity_emoji(project: &Project, cx: &App) -> Option<&'static str> {
+    let worktree = project.visible_worktrees(cx).next()?;
+    let worktree = worktree.read(cx);
+    let name = worktree.root_name_str();
+    let family_index = if name.starts_with("mobile-platform-ios") {
+        0
+    } else if name.starts_with("gaming-native") {
+        1
+    } else {
+        identity_hash(name) % IDENTITY_EMOJI_FAMILIES.len()
+    };
+    let family = IDENTITY_EMOJI_FAMILIES[family_index];
+    let path = worktree.abs_path();
+    Some(family[identity_hash(&path.to_string_lossy()) % family.len()])
+}
+
+fn identity_hash(value: &str) -> usize {
+    value.bytes().fold(0usize, |hash, byte| {
+        hash.wrapping_mul(31).wrapping_add(byte as usize)
+    })
+}
 
 static ZED_WINDOW_SIZE: LazyLock<Option<Size<Pixels>>> = LazyLock::new(|| {
     env::var("ZED_WINDOW_SIZE")
@@ -475,6 +573,14 @@ actions!(
         ToggleProjectSymbols
     ]
 );
+
+/// Opens project symbol search with an initial query.
+#[derive(Clone, PartialEq, Debug, Deserialize, JsonSchema, Action)]
+#[action(namespace = project_symbols)]
+#[serde(deny_unknown_fields)]
+pub struct OpenProjectSymbols {
+    pub query: String,
+}
 
 /// Toggles the file finder interface.
 #[derive(Default, PartialEq, Eq, Clone, Deserialize, JsonSchema, Action)]
@@ -1479,6 +1585,8 @@ pub struct Workspace {
     app_state: Arc<AppState>,
     dispatching_keystrokes: Rc<RefCell<DispatchingKeystrokes>>,
     _subscriptions: Vec<Subscription>,
+    window_status: WindowStatus,
+    _window_status_watcher: Option<Task<()>>,
     _apply_leader_updates: Task<Result<()>>,
     _observe_current_user: Task<Result<()>>,
     _schedule_serialize_workspace: Option<Task<()>>,
@@ -1618,12 +1726,14 @@ impl Workspace {
                 }
 
                 &project::Event::WorktreeRemoved(_) => {
+                    this.start_window_status_watcher(window, cx);
                     this.update_window_title(window, cx);
                     this.serialize_workspace(window, cx);
                     this.update_history(cx);
                 }
 
                 &project::Event::WorktreeAdded(id) => {
+                    this.start_window_status_watcher(window, cx);
                     this.update_window_title(window, cx);
                     if this
                         .project()
@@ -1906,6 +2016,7 @@ impl Workspace {
         ];
 
         cx.defer_in(window, move |this, window, cx| {
+            this.start_window_status_watcher(window, cx);
             this.update_window_title(window, cx);
             this.show_initial_notifications(cx);
         });
@@ -1951,6 +2062,8 @@ impl Workspace {
             app_state,
             _observe_current_user,
             _apply_leader_updates,
+            window_status: WindowStatus::default(),
+            _window_status_watcher: None,
             _schedule_serialize_workspace: None,
             _serialize_workspace_task: None,
             _schedule_serialize_ssh_paths: None,
@@ -2008,6 +2121,7 @@ impl Workspace {
 
         let db = WorkspaceDb::global(cx);
         let kvp = db::kvp::KeyValueStore::global(cx);
+        let use_system_window_tabs = WorkspaceSettings::get_global(cx).use_system_window_tabs;
         cx.spawn(async move |cx| {
             let mut paths_to_open = Vec::with_capacity(abs_paths.len());
             for path in abs_paths.into_iter() {
@@ -2207,6 +2321,27 @@ impl Workspace {
                 })?
                 .await
                 .unwrap_or_default();
+
+            if open_mode == OpenMode::NewWindow && use_system_window_tabs {
+                window
+                    .update(cx, |_, window, _| window.merge_all_windows())
+                    .log_err();
+            }
+
+            if should_apply_default_new_workspace_layout(open_mode, serialized_workspace_has_paths)
+            {
+                window
+                    .update(cx, |_, window, cx| {
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.set_dock_structure(
+                                default_new_workspace_dock_structure(),
+                                window,
+                                cx,
+                            );
+                        });
+                    })
+                    .log_err();
+            }
 
             // Restore default dock state for empty workspaces
             // Only restore if:
@@ -6454,6 +6589,36 @@ impl Workspace {
         self.update_window_title(window, cx);
     }
 
+    fn start_window_status_watcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self._window_status_watcher.take();
+
+        let Some(worktree) = self.project.read(cx).visible_worktrees(cx).next() else {
+            return;
+        };
+        let path = worktree.read(cx).abs_path().join(WINDOW_STATUS_PATH);
+        let fs = self.project.read(cx).fs().clone();
+        let (mut status_rx, watcher) = watch_config_file(cx.background_executor(), fs, path);
+
+        self._window_status_watcher = Some(cx.spawn_in(window, async move |this, cx| {
+            let _watcher = watcher;
+            while let Some(contents) = status_rx.next().await {
+                let status = parse_window_status(&contents);
+                if this
+                    .update_in(cx, |workspace, window, cx| {
+                        if workspace.window_status == status {
+                            return;
+                        }
+                        workspace.window_status = status;
+                        workspace.refresh_window_state(window, cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
+    }
+
     /// Whether this workspace may write the platform window's title and edited
     /// indicator.
     ///
@@ -6480,7 +6645,12 @@ impl Workspace {
 
     fn apply_window_title(&mut self, window: &mut Window, cx: &mut App) {
         let project = self.project().read(cx);
-        let mut title = String::new();
+        let mut title = format!("{} ", self.window_status.emoji);
+
+        if let Some(identity_emoji) = workspace_identity_emoji(&project, cx) {
+            title.push_str(identity_emoji);
+            title.push(' ');
+        }
 
         for (i, worktree) in project.visible_worktrees(cx).enumerate() {
             let name = worktree.read(cx).root_name_str();
@@ -6491,26 +6661,20 @@ impl Workspace {
             title.push_str(name);
         }
 
-        if title.is_empty() {
-            title = "empty project".to_string();
+        if title == format!("{} ", self.window_status.emoji) {
+            title.push_str("empty project");
         }
 
-        let active_project_path = self.active_item(cx).and_then(|item| item.project_path(cx));
-
-        if let Some(path) = active_project_path.as_ref() {
-            let filename = path.path.file_name().or_else(|| {
-                Some(
-                    project
-                        .worktree_for_id(path.worktree_id, cx)?
-                        .read(cx)
-                        .root_name_str(),
-                )
-            });
-
-            if let Some(filename) = filename {
-                title.push_str(" — ");
-                title.push_str(filename.as_ref());
-            }
+        if let Some(branch_name) = project.active_repository(cx).and_then(|repository| {
+            repository
+                .read(cx)
+                .branch
+                .as_ref()
+                .map(|branch| branch.name().to_string())
+        }) {
+            title.push_str(" [");
+            title.push_str(&branch_name);
+            title.push(']');
         }
 
         if project.is_via_collab() {
@@ -6519,7 +6683,9 @@ impl Workspace {
             title.push_str(" ↗");
         }
 
-        let document_path = active_project_path
+        let document_path = self
+            .active_item(cx)
+            .and_then(|item| item.project_path(cx))
             .as_ref()
             .and_then(|path| project.absolute_path(path, cx));
         window.set_document_path(document_path.as_deref());
@@ -12097,6 +12263,29 @@ mod tests {
     use settings::SettingsStore;
     use util::path;
     use util::rel_path::rel_path;
+
+    #[test]
+    fn test_default_new_workspace_layout_only_applies_to_new_workspaces() {
+        assert!(should_apply_default_new_workspace_layout(
+            OpenMode::NewWindow,
+            true,
+        ));
+        assert!(should_apply_default_new_workspace_layout(
+            OpenMode::Activate,
+            false,
+        ));
+        assert!(!should_apply_default_new_workspace_layout(
+            OpenMode::Activate,
+            true,
+        ));
+
+        let docks = default_new_workspace_dock_structure();
+        assert_eq!(docks.left.active_panel.as_deref(), Some("Project Panel"));
+        assert!(docks.left.visible);
+        assert_eq!(docks.right.active_panel.as_deref(), Some("TerminalPanel"));
+        assert!(docks.right.visible);
+        assert!(!docks.bottom.visible);
+    }
 
     #[gpui::test]
     async fn test_tab_disambiguation(cx: &mut TestAppContext) {

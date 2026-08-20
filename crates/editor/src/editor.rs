@@ -4644,6 +4644,7 @@ impl Editor {
         };
         IconButton::new(("breakpoint_indicator", row.0 as usize), icon)
             .icon_size(IconSize::XSmall)
+            .alpha(0.)
             .size(ui::ButtonSize::None)
             .when(is_rejected, |this| {
                 this.indicator(Indicator::icon(Icon::new(IconName::Warning)).color(Color::Warning))
@@ -12035,7 +12036,7 @@ impl EditorSnapshot {
                 // runnables, breakpoints and bookmarks are shown in the same place
                 // if all three are there only the runnable is shown
                 } else if show_runnables || show_breakpoints || show_bookmarks {
-                    ch_width * 3.0
+                    ch_width * 0.5
                 } else if show_git_gutter && show_line_numbers {
                     ch_width * 2.0
                 } else if show_git_gutter || show_line_numbers {
@@ -12044,16 +12045,10 @@ impl EditorSnapshot {
                     px(0.)
                 };
 
-            let shows_folds = is_singleton && gutter_settings.folds;
-
-            let right_padding = if shows_folds && show_line_numbers {
-                ch_width * 4.0
-            } else if shows_folds || (!is_singleton && show_line_numbers) {
-                ch_width * 3.0
-            } else if show_line_numbers {
-                ch_width
+            let right_padding = if show_line_numbers {
+                ch_width * 2.0
             } else {
-                px(0.)
+                Pixels::ZERO
             };
 
             GutterDimensions {

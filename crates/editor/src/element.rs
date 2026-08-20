@@ -99,13 +99,14 @@ use workspace::{
 /// Determines what kinds of highlights should be applied to a lines background.
 #[derive(Clone, Copy, Default)]
 struct LineHighlightSpec {
+    active: bool,
     selection: bool,
-    breakpoint: bool,
+    breakpoint_enabled: Option<bool>,
     _active_stack_frame: bool,
 }
 
 enum LineNumberStyle {
-    Breakpoint,
+    EnabledBreakpoint,
     DiffAdded,
     DiffDeleted,
     Active,
@@ -113,13 +114,17 @@ enum LineNumberStyle {
 }
 
 impl LineNumberStyle {
-    fn new(is_active: bool, is_breakpoint: bool, diff_status: Option<DiffHunkStatus>) -> Self {
+    fn new(
+        is_active: bool,
+        is_breakpoint_enabled: bool,
+        diff_status: Option<DiffHunkStatus>,
+    ) -> Self {
         match (
             is_active,
-            is_breakpoint,
+            is_breakpoint_enabled,
             diff_status.map(|status| status.kind),
         ) {
-            (_, true, _) => Self::Breakpoint,
+            (_, true, _) => Self::EnabledBreakpoint,
             (true, _, _) => Self::Active,
             (_, _, Some(DiffHunkStatusKind::Added)) => Self::DiffAdded,
             (_, _, Some(DiffHunkStatusKind::Deleted)) => Self::DiffDeleted,
@@ -129,7 +134,7 @@ impl LineNumberStyle {
 
     fn color(self, colors: &theme::ThemeColors) -> Hsla {
         match self {
-            Self::Breakpoint => colors.debugger_accent,
+            Self::EnabledBreakpoint => Hsla::white(),
             Self::DiffAdded => colors.version_control_added,
             Self::DiffDeleted => colors.version_control_deleted,
             Self::Active => colors.editor_active_line_number,
@@ -827,6 +832,7 @@ impl EditorElement {
                         let contains_non_empty_selection = active_rows
                             .entry(DisplayRow(row))
                             .or_insert_with(LineHighlightSpec::default);
+                        contains_non_empty_selection.active = true;
                         contains_non_empty_selection.selection |= !is_empty;
                     }
                     layouts.push(layout);
@@ -2804,8 +2810,8 @@ impl EditorElement {
 
                 let spec = active_rows.get(&display_row);
                 let color = LineNumberStyle::new(
-                    spec.is_some(),
-                    spec.is_some_and(|spec| spec.breakpoint),
+                    spec.is_some_and(|spec| spec.active),
+                    spec.is_some_and(|spec| spec.breakpoint_enabled == Some(true)),
                     row_info.diff_status,
                 )
                 .color(cx.theme().colors());
@@ -5060,6 +5066,28 @@ impl EditorElement {
                 }
                 if let Some((color, range, edges)) = current_paint {
                     paint_highlight(range.start, range.end, color, edges);
+                }
+
+                for (row, spec) in &layout.active_rows {
+                    if spec.breakpoint_enabled.is_some() {
+                        let bounds = Bounds {
+                            origin: point(
+                                layout.gutter_hitbox.left(),
+                                layout.gutter_hitbox.top()
+                                    + Pixels::from(
+                                        (row.as_f64() - scroll_top)
+                                            * ScrollPixelOffset::from(
+                                                layout.position_map.line_height,
+                                            ),
+                                    ),
+                            ),
+                            size: size(
+                                layout.gutter_hitbox.size.width,
+                                layout.position_map.line_height,
+                            ),
+                        };
+                        window.paint_quad(fill(bounds, cx.theme().colors().debugger_accent));
+                    }
                 }
 
                 for (guide_x, active) in layout.wrap_guides.iter() {
@@ -8489,10 +8517,11 @@ impl Element for EditorElement {
                         editor.active_breakpoints(start_row..end_row, window, cx)
                     });
 
-                    for (display_row, (_, bp, state)) in &breakpoint_rows {
-                        if bp.is_enabled() && state.is_none_or(|s| s.verified) {
-                            active_rows.entry(*display_row).or_default().breakpoint = true;
-                        }
+                    for (display_row, (_, breakpoint, _)) in &breakpoint_rows {
+                        active_rows
+                            .entry(*display_row)
+                            .or_default()
+                            .breakpoint_enabled = Some(breakpoint.is_enabled());
                     }
 
                     let gutter = Gutter {

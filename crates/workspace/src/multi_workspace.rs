@@ -934,11 +934,9 @@ impl MultiWorkspace {
         key: &ProjectGroupKey,
         cx: &App,
     ) -> Vec<Entity<Workspace>> {
-        self.held
-            .iter()
-            .filter(|held| held.pinned)
-            .map(|held| held.workspace.clone())
+        self.workspaces()
             .filter(|workspace| workspace.read(cx).project_group_key(cx) == *key)
+            .cloned()
             .collect()
     }
 

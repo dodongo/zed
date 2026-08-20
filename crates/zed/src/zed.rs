@@ -7912,8 +7912,7 @@ mod tests {
 
     #[gpui::test]
     async fn test_close_project_removes_project_group(cx: &mut TestAppContext) {
-        use util::path_list::PathList;
-        use workspace::{OpenMode, ProjectGroupKey};
+        use workspace::OpenMode;
 
         let app_state = init_test(cx);
         app_state
@@ -7937,27 +7936,28 @@ mod tests {
             .await
             .unwrap();
 
-        window.update(cx, |mw, _, cx| mw.open_sidebar(cx)).unwrap();
-        cx.background_executor.run_until_parked();
-
-        let project_key = ProjectGroupKey::new(None, PathList::new(&[path!("/my-project")]));
-        let keys = window
-            .read_with(cx, |mw, _| mw.project_group_keys())
+        let paths = window
+            .read_with(cx, |multi_workspace, cx| {
+                multi_workspace.workspace().read(cx).root_paths(cx)
+            })
             .unwrap();
         assert_eq!(
-            keys,
-            vec![project_key],
-            "project group should exist before CloseProject: {keys:?}"
+            paths,
+            vec![Path::new(path!("/my-project")).into()],
+            "project should be open before CloseProject: {paths:?}"
         );
 
         cx.dispatch_action(window.into(), CloseProject);
+        cx.background_executor.run_until_parked();
 
-        let keys = window
-            .read_with(cx, |mw, _| mw.project_group_keys())
+        let paths = window
+            .read_with(cx, |multi_workspace, cx| {
+                multi_workspace.workspace().read(cx).root_paths(cx)
+            })
             .unwrap();
         assert!(
-            keys.is_empty(),
-            "project group should be removed after CloseProject: {keys:?}"
+            paths.is_empty(),
+            "project should be closed after CloseProject: {paths:?}"
         );
     }
 

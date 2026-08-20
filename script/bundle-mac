@@ -21,13 +21,14 @@ Build the application bundle for macOS.
 
 Options:
   -d    Compile in debug mode
+  -f    Compile with the optimized release-fast profile
   -o    Open dir with the resulting DMG or launch the app itself in local mode.
-  -i    Install the resulting DMG into /Applications.
+  -i    Install the application into /Applications without creating a DMG.
   -h    Display this help and exit.
   "
 }
 
-while getopts 'dloih' flag
+while getopts 'dfoih' flag
 do
     case "${flag}" in
         o) open_result=true;;
@@ -36,6 +37,12 @@ do
             export CARGO_BUNDLE_SKIP_BUILD=true
             build_flag="";
             target_dir="debug"
+            ;;
+        f)
+            export CARGO_INCREMENTAL=true
+            export CARGO_BUNDLE_SKIP_BUILD=true
+            build_flag="--profile release-fast";
+            target_dir="release-fast"
             ;;
         i) local_install=true;;
         h)
@@ -46,6 +53,38 @@ do
 done
 
 shift $((OPTIND-1))
+
+configure_metal_toolchain() {
+    local component
+    component=$(xcodebuild -showComponent MetalToolchain 2>/dev/null || true)
+    if [[ "$component" != *"Status:"* ]]; then
+        if xcrun -sdk macosx metal --version >/dev/null 2>&1; then
+            return
+        fi
+        echo "Could not find the Xcode Metal toolchain component." >&2
+        exit 1
+    elif [[ "$component" != *"Status: installed"* ]]; then
+        echo "Installing the Xcode Metal toolchain"
+        xcodebuild -downloadComponent MetalToolchain
+        component=$(xcodebuild -showComponent MetalToolchain)
+    fi
+
+    local identifier
+    identifier=$(awk -F ': ' '/^Toolchain Identifier:/ { print $2; exit }' <<< "$component")
+    if [[ -z "$identifier" ]]; then
+        echo "Could not find an installed Xcode Metal toolchain." >&2
+        echo "Run: xcodebuild -downloadComponent MetalToolchain" >&2
+        exit 1
+    fi
+
+    export TOOLCHAINS="$identifier"
+    if ! xcrun -sdk macosx metal --version >/dev/null 2>&1; then
+        echo "Metal toolchain $identifier is installed but cannot run." >&2
+        exit 1
+    fi
+}
+
+configure_metal_toolchain
 
 
 # Get release channel
@@ -82,7 +121,11 @@ else
 fi
 
 # Generate the licenses first, so they can be baked into the binaries
-script/generate-licenses
+if [[ "$local_install" = true && -s assets/licenses.md ]]; then
+    echo "Using the checked-in licenses for the local build"
+else
+    script/generate-licenses
+fi
 
 rustup target add $target_triple
 
@@ -94,15 +137,7 @@ cargo --config .cargo/bundle-config.toml build ${build_flag} --package remote_se
 
 echo "Creating application bundle"
 pushd crates/zed
-cp Cargo.toml Cargo.toml.backup
-sed \
-    -i.backup \
-    "s/package.metadata.bundle-${channel}/package.metadata.bundle/" \
-    Cargo.toml
-
-app_path=$(cargo bundle ${build_flag} --target $target_triple --select-workspace-root | xargs)
-
-mv Cargo.toml.backup Cargo.toml
+app_path=$(cargo bundle ${build_flag} --target $target_triple | xargs)
 popd
 echo "Bundled ${app_path}"
 
@@ -236,8 +271,8 @@ function sign_app_binaries() {
         open "$app_path"
     fi
 
-    if [[ "$target_dir" = "debug" ]]; then
-        echo "Debug build detected - skipping DMG creation and signing"
+    if [[ "$target_dir" = "debug" || "$local_install" = true ]]; then
+        echo "Local build detected - skipping DMG creation and signing"
         if [ "$local_install" = false ]; then
             echo "Created application bundle:"
             echo "$app_path"
@@ -330,11 +365,15 @@ function upload_debug_symbols() {
     fi
 }
 
-upload_debug_symbols
+if [[ "$target_dir" != "debug" ]]; then
+    upload_debug_symbols
+fi
 
 cp target/${target_triple}/${target_dir}/zed "${app_path}/Contents/MacOS/zed"
 cp target/${target_triple}/${target_dir}/cli "${app_path}/Contents/MacOS/cli"
 sign_app_binaries
 
-sign_binary "target/$target_triple/release/remote_server"
-gzip -f --stdout --best target/$target_triple/release/remote_server > target/zed-remote-server-macos-$arch_suffix.gz
+if [[ "$target_dir" != "debug" ]]; then
+    sign_binary "target/$target_triple/$target_dir/remote_server"
+    gzip -f --stdout --best target/$target_triple/$target_dir/remote_server > target/zed-remote-server-macos-$arch_suffix.gz
+fi

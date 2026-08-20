@@ -9,16 +9,17 @@ use crate::{
 use breadcrumbs::Breadcrumbs;
 use collections::HashMap;
 use db::kvp::KeyValueStore;
-use futures::{channel::oneshot, future::join_all};
+use futures::{StreamExt, channel::oneshot, future::join_all};
 use gpui::{
-    Action, Anchor, App, AsyncApp, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle,
+    Action, Anchor, App, AsyncApp, AsyncWindowContext, Context, Entity, EntityId, EventEmitter,
+    FocusHandle,
     Focusable, IntoElement, ParentElement, Pixels, Render, Styled, Task, TaskExt, WeakEntity,
     Window, actions,
 };
 use itertools::Itertools;
 use project::{Fs, Project};
 
-use settings::{Settings, TerminalDockPosition};
+use settings::{Settings, TerminalDockPosition, watch_config_file};
 use task::{RevealStrategy, RevealTarget, Shell, ShellBuilder, SpawnInTerminal, TaskId};
 use terminal::{Terminal, terminal_settings::TerminalSettings};
 use ui::{
@@ -31,7 +32,7 @@ use workspace::{
     ActivatePaneUp, ActivatePreviousPane, DraggedTab, ItemId, MoveItemToPane,
     MoveItemToPaneInDirection, MovePaneDown, MovePaneLeft, MovePaneRight, MovePaneUp, Pane,
     PaneGroup, SplitDirection, SplitDown, SplitLeft, SplitMode, SplitRight, SplitUp, SwapPaneDown,
-    SwapPaneLeft, SwapPaneRight, SwapPaneUp, ToggleZoom, Workspace,
+    SaveIntent, SwapPaneLeft, SwapPaneRight, SwapPaneUp, ToggleZoom, Workspace,
     dock::{DockPosition, Panel, PanelEvent, PanelHandle},
     item::SerializableItem,
     move_active_item, pane,
@@ -48,9 +49,36 @@ actions!(
         /// Toggles the terminal panel.
         Toggle,
         /// Toggles focus on the terminal panel.
-        ToggleFocus
+        ToggleFocus,
+        /// Replaces every terminal in the panel with one fresh terminal,
+        /// discarding the old shells but keeping anything they attach to
+        /// (for example herdr sessions) alive on their servers.
+        ReopenTerminals
     ]
 );
+
+/// Project-root file that external automation writes to drive the terminal
+/// panel, mirroring the window-status channel. A fresh `reopen` command
+/// replaces all terminals; Zed deletes the file as the acknowledgement.
+const TERMINAL_CONTROL_PATH: &str = ".zed/terminal-control.json";
+const TERMINAL_CONTROL_FRESHNESS: Duration = Duration::from_secs(120);
+
+fn control_requests_reopen(contents: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(contents) else {
+        return false;
+    };
+    if value.get("command").and_then(|command| command.as_str()) != Some("reopen") {
+        return false;
+    }
+    let issued_at = value
+        .get("issued_at")
+        .and_then(|issued_at| issued_at.as_u64())
+        .unwrap_or(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    now.saturating_sub(issued_at) <= TERMINAL_CONTROL_FRESHNESS.as_secs()
+}
 
 pub fn init(cx: &mut App) {
     cx.observe_new(
@@ -67,6 +95,16 @@ pub fn init(cx: &mut App) {
                     if !workspace.toggle_panel_focus::<TerminalPanel>(window, cx) {
                         workspace.close_panel::<TerminalPanel>(window, cx);
                     }
+                }
+            });
+            workspace.register_action(|workspace, _: &ReopenTerminals, window, cx| {
+                if !is_enabled_in_workspace(workspace, cx) {
+                    return;
+                }
+                if let Some(terminal_panel) = workspace.panel::<TerminalPanel>(cx) {
+                    terminal_panel.update(cx, |terminal_panel, cx| {
+                        terminal_panel.reopen_terminals(window, cx)
+                    });
                 }
             });
         },
@@ -87,6 +125,7 @@ pub struct TerminalPanel {
     deferred_tasks: HashMap<TaskId, Task<()>>,
     assistant_enabled: bool,
     active: bool,
+    _control_watcher: Option<Task<()>>,
 }
 
 impl TerminalPanel {
@@ -107,8 +146,21 @@ impl TerminalPanel {
             deferred_tasks: HashMap::default(),
             assistant_enabled: false,
             active: false,
+            _control_watcher: None,
         };
         terminal_panel.apply_tab_bar_buttons(&terminal_panel.active_pane, cx);
+        cx.subscribe_in(
+            project,
+            window,
+            |terminal_panel, project, event, window, cx| {
+                if matches!(event, project::Event::WorktreeAdded(_)) {
+                    terminal_panel.start_control_watcher(project.clone(), window, cx);
+                }
+            },
+        )
+        .detach();
+        let mut terminal_panel = terminal_panel;
+        terminal_panel.start_control_watcher(project.clone(), window, cx);
         terminal_panel
     }
 
@@ -1209,6 +1261,74 @@ impl TerminalPanel {
     /// Returns all panes in the terminal panel.
     pub fn panes(&self) -> Vec<&Entity<Pane>> {
         self.center.panes()
+    }
+
+    /// Watches the project root's terminal-control file so external
+    /// automation can replace this panel's terminals without UI scripting.
+    fn start_control_watcher(
+        &mut self,
+        project: Entity<Project>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self._control_watcher.take();
+        let Some(worktree) = project.read(cx).visible_worktrees(cx).next() else {
+            return;
+        };
+        let path = worktree.read(cx).abs_path().join(TERMINAL_CONTROL_PATH);
+        let fs = self.fs.clone();
+        let (mut control_rx, watcher) =
+            watch_config_file(cx.background_executor(), fs.clone(), path.clone());
+        self._control_watcher = Some(cx.spawn_in(window, async move |terminal_panel, cx| {
+            let _watcher = watcher;
+            while let Some(contents) = control_rx.next().await {
+                if contents.is_empty() {
+                    continue;
+                }
+                let reopen = control_requests_reopen(&contents);
+                fs.remove_file(&path, Default::default()).await.log_err();
+                if !reopen {
+                    continue;
+                }
+                if terminal_panel
+                    .update_in(cx, |terminal_panel, window, cx| {
+                        terminal_panel.reopen_terminals(window, cx)
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// Opens one fresh terminal, then closes every terminal that predates it,
+    /// so the panel's shell processes restart while whatever they attach to
+    /// (for example herdr sessions) keeps running on its server.
+    pub fn reopen_terminals(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let stale_items: Vec<(Entity<Pane>, Vec<EntityId>)> = self
+            .center
+            .panes()
+            .into_iter()
+            .map(|pane| {
+                let item_ids = pane.read(cx).items().map(|item| item.item_id()).collect();
+                (pane.clone(), item_ids)
+            })
+            .collect();
+        let new_terminal = self.add_terminal_shell(None, RevealStrategy::Always, window, cx);
+        cx.spawn_in(window, async move |_, cx| {
+            new_terminal.await?;
+            for (pane, item_ids) in stale_items {
+                pane.update_in(cx, |pane, window, cx| {
+                    pane.close_items(window, cx, SaveIntent::Skip, &|item_id| {
+                        item_ids.contains(&item_id)
+                    })
+                })?
+                .await?;
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     /// Returns all non-empty terminal selections from all terminal views in all panes.

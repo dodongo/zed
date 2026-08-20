@@ -21,6 +21,21 @@ pub fn init(cx: &mut App) {
     cx.observe_new(
         |workspace: &mut Workspace, _window, _: &mut Context<Workspace>| {
             workspace.register_action(
+                |workspace, action: &workspace::OpenProjectSymbols, window, cx| {
+                    let project = workspace.project().clone();
+                    let handle = cx.entity().downgrade();
+                    let query = action.query.clone();
+                    workspace.toggle_modal(window, cx, move |window, cx| {
+                        let delegate = ProjectSymbolsDelegate::new(handle, project.clone());
+                        let preview = picker_preview::editor_preview(project, window, cx);
+                        let picker =
+                            Picker::uniform_list_with_preview(delegate, preview, window, cx);
+                        picker.set_query(&query, window, cx);
+                        picker
+                    })
+                },
+            );
+            workspace.register_action(
                 |workspace, _: &workspace::ToggleProjectSymbols, window, cx| {
                     let project = workspace.project().clone();
                     let handle = cx.entity().downgrade();

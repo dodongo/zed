@@ -22,7 +22,8 @@ use language::{BufferSnapshot, Point};
 use open_path_prompt::{OpenPathPrompt, file_finder_settings::FileFinderSettings};
 use picker::{Picker, PickerDelegate};
 use project::{
-    PathMatchCandidateSet, Project, ProjectPath, WorktreeId, worktree_store::WorktreeStore,
+    DirectoryLister, PathMatchCandidateSet, Project, ProjectPath, WorktreeId,
+    worktree_store::WorktreeStore,
 };
 
 use settings::{ModalWidthContent, Settings, SettingsStore};
@@ -57,7 +58,9 @@ actions!(
         SelectPrevious,
         /// Opens the selected file in the editor without dismissing the file finder,
         /// so additional files can be opened in sequence.
-        OpenWithoutDismiss
+        OpenWithoutDismiss,
+        /// Searches workspace files and symbols, and accepts absolute paths.
+        OpenGlobal
     ]
 );
 
@@ -76,6 +79,50 @@ pub fn init(cx: &mut App) {
 }
 
 impl FileFinder {
+    fn open_path_prompt(
+        workspace: &mut Workspace,
+        initial_query: String,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let lister = DirectoryLister::Project(workspace.project().clone());
+        let selected_paths = OpenPathPrompt::prompt_for_open_path_with_query(
+            workspace,
+            lister,
+            Some(initial_query),
+            window,
+            cx,
+        );
+        cx.spawn_in(window, async move |workspace, cx| {
+            let Some(path) = selected_paths
+                .await
+                .ok()
+                .flatten()
+                .and_then(|paths| paths.into_iter().next())
+            else {
+                return;
+            };
+            let Some(open_task) = workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.open_abs_path(
+                        path,
+                        OpenOptions {
+                            visible: Some(OpenVisible::None),
+                            ..Default::default()
+                        },
+                        window,
+                        cx,
+                    )
+                })
+                .log_err()
+            else {
+                return;
+            };
+            open_task.await.log_err();
+        })
+        .detach();
+    }
+
     fn register(
         workspace: &mut Workspace,
         _window: Option<&mut Window>,
@@ -88,6 +135,7 @@ impl FileFinder {
                         workspace,
                         action.separate_history,
                         action.include_ignored,
+                        false,
                         window,
                         cx,
                     )
@@ -103,12 +151,16 @@ impl FileFinder {
                 });
             },
         );
+        workspace.register_action(|workspace, _: &OpenGlobal, window, cx| {
+            Self::open(workspace, false, None, true, window, cx).detach();
+        });
     }
 
     fn open(
         workspace: &mut Workspace,
         separate_history: bool,
         include_ignored: Option<bool>,
+        open_global: bool,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Task<()> {
@@ -162,6 +214,7 @@ impl FileFinder {
                             history_items.collect(),
                             separate_history,
                             include_ignored,
+                            open_global,
                             window,
                             cx,
                         );
@@ -372,6 +425,7 @@ pub struct FileFinderDelegate {
     search_in_flight: Arc<AtomicBool>,
     history_items: Vec<FoundPath>,
     separate_history: bool,
+    open_global: bool,
     first_update: bool,
     focus_handle: FocusHandle,
     include_ignored: Option<bool>,
@@ -960,6 +1014,7 @@ impl FileFinderDelegate {
         history_items: Vec<FoundPath>,
         separate_history: bool,
         include_ignored: Option<bool>,
+        open_global: bool,
         window: &mut Window,
         cx: &mut Context<FileFinder>,
     ) -> Self {
@@ -987,6 +1042,7 @@ impl FileFinderDelegate {
             search_in_flight: Arc::new(AtomicBool::new(false)),
             history_items,
             separate_history,
+            open_global,
             first_update: true,
             focus_handle: cx.focus_handle(),
             include_ignored: include_ignored.or(FileFinderSettings::get_global(cx).include_ignored),
@@ -1873,6 +1929,27 @@ impl PickerDelegate for FileFinderDelegate {
     ) -> Task<()> {
         let debounce_refresh = mem::take(&mut self.debounce_next_refresh);
         let raw_query = raw_query.trim();
+
+        if self.open_global
+            && let Some(query) = raw_query.strip_prefix('#')
+        {
+            window.dispatch_action(
+                Box::new(workspace::OpenProjectSymbols {
+                    query: query.trim_start().to_owned(),
+                }),
+                cx,
+            );
+            return Task::ready(());
+        }
+
+        if self.open_global && (raw_query.starts_with('~') || Path::new(raw_query).is_absolute()) {
+            self.workspace
+                .update(cx, |workspace, cx| {
+                    FileFinder::open_path_prompt(workspace, raw_query.to_owned(), window, cx);
+                })
+                .log_err();
+            return Task::ready(());
+        }
 
         let raw_query = match &raw_query.get(0..2) {
             Some(".\\" | "./") => &raw_query[2..],

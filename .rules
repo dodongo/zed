@@ -136,6 +136,17 @@ Other entities can then register a callback to handle these events by doing `cx.
 
 - Use `./script/clippy` instead of `cargo clippy`
 
+## Local Zed app updates
+
+This checkout is the active custom Zed build. After changing Zed source, rebuild and install the app before handing back the change:
+
+```sh
+cd /Users/d.gaxho/Projects/zed
+PATH="$HOME/.cargo/bin:$PATH" ./script/bundle-mac -d -i
+```
+
+This installs the result at `/Applications/Zed.app`. Quit and relaunch Zed after installing so the running process loads the new build.
+
 # Pull request hygiene
 
 When an agent opens or updates a pull request, it must:
