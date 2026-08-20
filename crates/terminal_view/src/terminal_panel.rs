@@ -101,9 +101,10 @@ pub fn init(cx: &mut App) {
                 if !is_enabled_in_workspace(workspace, cx) {
                     return;
                 }
+                let cwd = default_working_directory(workspace, cx);
                 if let Some(terminal_panel) = workspace.panel::<TerminalPanel>(cx) {
                     terminal_panel.update(cx, |terminal_panel, cx| {
-                        terminal_panel.reopen_terminals(window, cx)
+                        terminal_panel.reopen_terminals(cwd, window, cx)
                     });
                 }
             });
@@ -1290,9 +1291,10 @@ impl TerminalPanel {
                 if !reopen {
                     continue;
                 }
+                let cwd = path.parent().and_then(|p| p.parent()).map(PathBuf::from);
                 if terminal_panel
                     .update_in(cx, |terminal_panel, window, cx| {
-                        terminal_panel.reopen_terminals(window, cx)
+                        terminal_panel.reopen_terminals(cwd, window, cx)
                     })
                     .is_err()
                 {
@@ -1305,7 +1307,12 @@ impl TerminalPanel {
     /// Opens one fresh terminal, then closes every terminal that predates it,
     /// so the panel's shell processes restart while whatever they attach to
     /// (for example herdr sessions) keeps running on its server.
-    pub fn reopen_terminals(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn reopen_terminals(
+        &mut self,
+        cwd: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let stale_items: Vec<(Entity<Pane>, Vec<EntityId>)> = self
             .center
             .panes()
@@ -1315,7 +1322,7 @@ impl TerminalPanel {
                 (pane.clone(), item_ids)
             })
             .collect();
-        let new_terminal = self.add_terminal_shell(None, RevealStrategy::Always, window, cx);
+        let new_terminal = self.add_terminal_shell(cwd, RevealStrategy::Always, window, cx);
         cx.spawn_in(window, async move |_, cx| {
             new_terminal.await?;
             for (pane, item_ids) in stale_items {
