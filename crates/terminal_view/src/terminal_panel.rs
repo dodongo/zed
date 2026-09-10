@@ -12,9 +12,8 @@ use db::kvp::KeyValueStore;
 use futures::{StreamExt, channel::oneshot, future::join_all};
 use gpui::{
     Action, Anchor, App, AsyncApp, AsyncWindowContext, Context, Entity, EntityId, EventEmitter,
-    FocusHandle,
-    Focusable, IntoElement, ParentElement, Pixels, Render, Styled, Task, TaskExt, WeakEntity,
-    Window, actions,
+    FocusHandle, Focusable, IntoElement, ParentElement, Pixels, Render, Styled, Task, TaskExt,
+    WeakEntity, Window, actions,
 };
 use itertools::Itertools;
 use project::{Fs, Project};
@@ -31,8 +30,8 @@ use workspace::{
     ActivateNextPane, ActivatePane, ActivatePaneDown, ActivatePaneLeft, ActivatePaneRight,
     ActivatePaneUp, ActivatePreviousPane, DraggedTab, ItemId, MoveItemToPane,
     MoveItemToPaneInDirection, MovePaneDown, MovePaneLeft, MovePaneRight, MovePaneUp, Pane,
-    PaneGroup, SplitDirection, SplitDown, SplitLeft, SplitMode, SplitRight, SplitUp, SwapPaneDown,
-    SaveIntent, SwapPaneLeft, SwapPaneRight, SwapPaneUp, ToggleZoom, Workspace,
+    PaneGroup, SaveIntent, SplitDirection, SplitDown, SplitLeft, SplitMode, SplitRight, SplitUp,
+    SwapPaneDown, SwapPaneLeft, SwapPaneRight, SwapPaneUp, ToggleZoom, Workspace,
     dock::{DockPosition, Panel, PanelEvent, PanelHandle},
     item::SerializableItem,
     move_active_item, pane,
@@ -1322,7 +1321,7 @@ impl TerminalPanel {
                 (pane.clone(), item_ids)
             })
             .collect();
-        let new_terminal = self.add_terminal_shell(cwd, RevealStrategy::Always, window, cx);
+        let new_terminal = self.add_terminal_shell(false, cwd, RevealStrategy::Always, window, cx);
         cx.spawn_in(window, async move |_, cx| {
             new_terminal.await?;
             for (pane, item_ids) in stale_items {

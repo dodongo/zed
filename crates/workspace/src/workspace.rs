@@ -12358,6 +12358,9 @@ mod tests {
         .await;
 
         let project = Project::test(fs, ["root1".as_ref()], cx).await;
+        let root1_title = project.read_with(cx, |project, cx| {
+            format!("◯ {} root1", workspace_identity_emoji(project, cx).unwrap())
+        });
         let (workspace, cx) =
             cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
         let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
@@ -12384,13 +12387,13 @@ mod tests {
                     .map(|e| e.id)
             );
         });
-        assert_eq!(cx.window_title().as_deref(), Some("root1 — one.txt"));
+        assert_eq!(cx.window_title().as_deref(), Some(root1_title.as_str()));
 
         // Add a second item to a non-empty pane
         workspace.update_in(cx, |workspace, window, cx| {
             workspace.add_item_to_active_pane(Box::new(item2), None, true, window, cx)
         });
-        assert_eq!(cx.window_title().as_deref(), Some("root1 — two.txt"));
+        assert_eq!(cx.window_title().as_deref(), Some(root1_title.as_str()));
         project.update(cx, |project, cx| {
             assert_eq!(
                 project.active_entry(),
@@ -12406,7 +12409,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(cx.window_title().as_deref(), Some("root1 — one.txt"));
+        assert_eq!(cx.window_title().as_deref(), Some(root1_title.as_str()));
         project.update(cx, |project, cx| {
             assert_eq!(
                 project.active_entry(),
@@ -12423,11 +12426,17 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(cx.window_title().as_deref(), Some("root1, root2 — one.txt"));
+        assert_eq!(
+            cx.window_title().as_deref(),
+            Some(format!("{root1_title}, root2").as_str())
+        );
 
         // Remove a project folder
         project.update(cx, |project, cx| project.remove_worktree(worktree_id, cx));
-        assert_eq!(cx.window_title().as_deref(), Some("root2 — one.txt"));
+        let root2_title = project.read_with(cx, |project, cx| {
+            format!("◯ {} root2", workspace_identity_emoji(project, cx).unwrap())
+        });
+        assert_eq!(cx.window_title().as_deref(), Some(root2_title.as_str()));
     }
 
     #[gpui::test]
@@ -18453,6 +18462,12 @@ mod tests {
 
         let project_a = Project::test(fs.clone(), [path!("/root1").as_ref()], cx).await;
         let project_b = Project::test(fs, [path!("/root2").as_ref()], cx).await;
+        let root1_title = project_a.read_with(cx, |project, cx| {
+            format!("◯ {} root1", workspace_identity_emoji(project, cx).unwrap())
+        });
+        let root2_title = project_b.read_with(cx, |project, cx| {
+            format!("◯ {} root2", workspace_identity_emoji(project, cx).unwrap())
+        });
 
         let multi_workspace_handle =
             cx.add_window(|window, cx| MultiWorkspace::test_new(project_a.clone(), window, cx));
@@ -18462,7 +18477,7 @@ mod tests {
 
         let cx = &mut VisualTestContext::from_window(multi_workspace_handle.into(), cx);
         cx.run_until_parked();
-        assert_eq!(cx.window_title().as_deref(), Some("root1"));
+        assert_eq!(cx.window_title().as_deref(), Some(root1_title.as_str()));
 
         // Activating a second workspace must update the shared window's title.
         multi_workspace_handle
@@ -18471,7 +18486,7 @@ mod tests {
             })
             .unwrap();
         cx.run_until_parked();
-        assert_eq!(cx.window_title().as_deref(), Some("root2"));
+        assert_eq!(cx.window_title().as_deref(), Some(root2_title.as_str()));
 
         // Switching back must update the title again, even though workspace A's
         // own computed title hasn't changed since it was last active. This is
@@ -18483,7 +18498,7 @@ mod tests {
             })
             .unwrap();
         cx.run_until_parked();
-        assert_eq!(cx.window_title().as_deref(), Some("root1"));
+        assert_eq!(cx.window_title().as_deref(), Some(root1_title.as_str()));
     }
 
     #[gpui::test]
@@ -18499,13 +18514,19 @@ mod tests {
 
         let project_a = Project::test(fs.clone(), [path!("/root1").as_ref()], cx).await;
         let project_b = Project::test(fs.clone(), [path!("/root2").as_ref()], cx).await;
+        let root1_title = project_a.read_with(cx, |project, cx| {
+            format!("◯ {} root1", workspace_identity_emoji(project, cx).unwrap())
+        });
+        let root2_title = project_b.read_with(cx, |project, cx| {
+            format!("◯ {} root2", workspace_identity_emoji(project, cx).unwrap())
+        });
 
         let multi_workspace_handle =
             cx.add_window(|window, cx| MultiWorkspace::test_new(project_a.clone(), window, cx));
 
         let cx = &mut VisualTestContext::from_window(multi_workspace_handle.into(), cx);
         cx.run_until_parked();
-        assert_eq!(cx.window_title().as_deref(), Some("root1"));
+        assert_eq!(cx.window_title().as_deref(), Some(root1_title.as_str()));
 
         // Switch to workspace B; workspace A becomes a background workspace whose
         // event subscriptions are still live.
@@ -18515,7 +18536,7 @@ mod tests {
             })
             .unwrap();
         cx.run_until_parked();
-        assert_eq!(cx.window_title().as_deref(), Some("root2"));
+        assert_eq!(cx.window_title().as_deref(), Some(root2_title.as_str()));
 
         // A title-affecting change in the background workspace A must not touch
         // the shared window's title, which belongs to the active workspace B.
@@ -18526,7 +18547,7 @@ mod tests {
             .await
             .unwrap();
         cx.run_until_parked();
-        assert_eq!(cx.window_title().as_deref(), Some("root2"));
+        assert_eq!(cx.window_title().as_deref(), Some(root2_title.as_str()));
     }
 
     fn pane_items_paths(pane: &Entity<Pane>, cx: &App) -> Vec<String> {
