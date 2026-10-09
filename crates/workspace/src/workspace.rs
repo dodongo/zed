@@ -6685,10 +6685,23 @@ impl Workspace {
         }
 
         for (i, worktree) in project.visible_worktrees(cx).enumerate() {
-            let name = worktree.read(cx).root_name_str();
+            let worktree = worktree.read(cx);
+            let name = worktree.root_name_str();
 
             if i > 0 {
                 title.push_str(", ");
+            }
+            // Name a linked git worktree after its main worktree too, as "main/linked".
+            let main_worktree_name = project.repositories(cx).values().find_map(|repository| {
+                let repository = repository.read(cx);
+                (repository.is_linked_worktree()
+                    && *repository.work_directory_abs_path == *worktree.abs_path())
+                .then(|| repository.main_worktree_abs_path()?.file_name()?.to_str())
+                .flatten()
+            });
+            if let Some(main_worktree_name) = main_worktree_name {
+                title.push_str(main_worktree_name);
+                title.push('/');
             }
             title.push_str(name);
         }
