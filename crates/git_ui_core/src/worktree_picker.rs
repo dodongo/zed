@@ -11,7 +11,12 @@ use gpui::{
     Render, SharedString, Styled, Subscription, Task, TaskExt, WeakEntity, Window, actions,
 };
 use picker::{Picker, PickerDelegate, PickerEditorPosition};
-use project::{Project, git_store::RepositoryEvent, repo_identity_path_if_local};
+use project::{
+    Project, git_store::RepositoryEvent, project_settings::ProjectSettings,
+    repo_identity_path_if_local,
+};
+use serde::Deserialize;
+use settings::Settings as _;
 use ui::{
     Button, CommonAnimationExt as _, Divider, HighlightedLabel, IconButton, KeyBinding, ListItem,
     ListItemSpacing, ListSubHeader, Tooltip, prelude::*,
@@ -110,6 +115,13 @@ impl WorktreePicker {
 
         let initial_matches = vec![WorktreeEntry::CreateFromCurrentBranch];
 
+        let list_command = ProjectSettings::get_global(cx)
+            .git
+            .worktree_list_command
+            .clone();
+        let mut window_folders: Vec<PathBuf> = active_worktree_paths.iter().cloned().collect();
+        window_folders.sort();
+
         let delegate = WorktreePickerDelegate {
             matches: initial_matches,
             all_worktrees: Vec::new(),
@@ -128,6 +140,7 @@ impl WorktreePicker {
             active_worktree_paths,
             hovered_delete_index: None,
             deleting_worktree_paths: HashSet::default(),
+            listed_worktrees: list_command.as_ref().map(|_| Ok(Vec::new())),
         };
 
         let picker = cx.new(|cx| {
@@ -143,6 +156,28 @@ impl WorktreePicker {
         });
 
         let mut subscriptions = Vec::new();
+
+        if let Some(list_command) = list_command {
+            let picker_handle = picker.downgrade();
+            cx.spawn_in(window, async move |_this, cx| {
+                let listed = run_worktree_list_command(&list_command, &window_folders)
+                    .await
+                    .map_err(|error| {
+                        log::error!("WorktreePicker: worktree list command failed: {error:#}");
+                        SharedString::from(format!("Worktree list command failed: {error:#}"))
+                    });
+                picker_handle.update_in(cx, |picker, window, cx| {
+                    picker.delegate.all_worktrees = listed
+                        .as_ref()
+                        .map(|listed| listed.iter().map(ListedWorktree::git_worktree).collect())
+                        .unwrap_or_default();
+                    picker.delegate.listed_worktrees = Some(listed);
+                    picker.refresh(window, cx);
+                })?;
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
+        }
 
         {
             let picker_handle = picker.downgrade();
@@ -170,7 +205,9 @@ impl WorktreePicker {
                 };
 
                 picker_handle.update_in(cx, |picker, window, cx| {
-                    picker.delegate.all_worktrees = all_worktrees;
+                    if picker.delegate.listed_worktrees.is_none() {
+                        picker.delegate.all_worktrees = all_worktrees;
+                    }
                     picker.delegate.default_branch =
                         default_branch.and_then(|branch| RemoteBranchName::parse(&branch));
                     picker.delegate.refresh_project_worktree_paths(window, cx);
@@ -198,8 +235,10 @@ impl WorktreePicker {
                                 .filter(|wt| !wt.is_bare)
                                 .collect();
                             picker.update_in(cx, |picker, window, cx| {
-                                picker.delegate.all_worktrees = all_worktrees;
-                                picker.refresh(window, cx);
+                                if picker.delegate.listed_worktrees.is_none() {
+                                    picker.delegate.all_worktrees = all_worktrees;
+                                    picker.refresh(window, cx);
+                                }
                             })?;
                             anyhow::Ok(())
                         })
@@ -271,6 +310,56 @@ impl Render for WorktreePicker {
     }
 }
 
+/// One entry printed by the `git.worktree_list_command` setting's command.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+struct ListedWorktree {
+    path: PathBuf,
+    name: String,
+    branch: Option<String>,
+    section: Option<String>,
+}
+
+impl ListedWorktree {
+    fn git_worktree(&self) -> GitWorktree {
+        GitWorktree {
+            path: self.path.clone(),
+            ref_name: self
+                .branch
+                .as_ref()
+                .map(|branch| format!("refs/heads/{branch}").into()),
+            sha: SharedString::default(),
+            is_main: false,
+            is_bare: false,
+        }
+    }
+}
+
+async fn run_worktree_list_command(
+    command: &[String],
+    window_folders: &[PathBuf],
+) -> anyhow::Result<Vec<ListedWorktree>> {
+    let (program, arguments) = command.split_first().context("the command is empty")?;
+    let program = match program.strip_prefix("~/") {
+        Some(relative) => util::paths::home_dir().join(relative),
+        None => PathBuf::from(program),
+    };
+    let output = util::command::new_command(&program)
+        .args(arguments)
+        .args(window_folders)
+        .output()
+        .await
+        .with_context(|| format!("failed to run {}", program.display()))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "{} exited with {}: {}",
+        program.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("{} printed invalid JSON", program.display()))
+}
+
 #[derive(Clone)]
 enum WorktreeEntry {
     CreateFromCurrentBranch,
@@ -308,6 +397,9 @@ struct WorktreePickerDelegate {
     modifiers: Modifiers,
     hovered_delete_index: Option<usize>,
     deleting_worktree_paths: HashSet<PathBuf>,
+    /// The `git.worktree_list_command` output, which replaces the git worktree
+    /// list; `None` when that setting is unset.
+    listed_worktrees: Option<Result<Vec<ListedWorktree>, SharedString>>,
 }
 
 fn worktree_name_anchor<'a>(
@@ -450,6 +542,49 @@ impl WorktreePickerDelegate {
         &self.all_worktrees
     }
 
+    fn display_name(&self, worktree: &GitWorktree) -> String {
+        match &self.listed_worktrees {
+            Some(Ok(listed)) => listed
+                .iter()
+                .find(|entry| entry.path == worktree.path)
+                .map(|entry| entry.name.clone())
+                .unwrap_or_else(|| worktree.directory_name(None)),
+            _ => worktree.directory_name(self.worktree_name_anchor()),
+        }
+    }
+
+    fn listed_matches(
+        &self,
+        listed: &Result<Vec<ListedWorktree>, SharedString>,
+    ) -> Vec<WorktreeEntry> {
+        let mut matches = self.build_fixed_entries();
+        matches.push(WorktreeEntry::Separator);
+        let listed = match listed {
+            Ok(listed) => listed,
+            Err(error) => {
+                matches.push(WorktreeEntry::SectionHeader(error.clone()));
+                return matches;
+            }
+        };
+        let mut section: Option<&String> = None;
+        for entry in listed {
+            if entry.section.is_some() && entry.section.as_ref() != section {
+                if !matches!(matches.last(), Some(WorktreeEntry::Separator)) {
+                    matches.push(WorktreeEntry::Separator);
+                }
+                matches.push(WorktreeEntry::SectionHeader(
+                    entry.section.clone().unwrap_or_default().into(),
+                ));
+            }
+            section = entry.section.as_ref();
+            matches.push(WorktreeEntry::Worktree {
+                worktree: entry.git_worktree(),
+                positions: Vec::new(),
+            });
+        }
+        matches
+    }
+
     fn creation_blocked_reason(&self, cx: &App) -> Option<SharedString> {
         let project = self.project.read(cx);
         if project.is_via_collab() {
@@ -462,7 +597,9 @@ impl WorktreePickerDelegate {
     }
 
     fn can_delete_worktree(&self, worktree: &GitWorktree) -> bool {
-        !worktree.is_main && !self.project_worktree_paths.contains(&worktree.path)
+        self.listed_worktrees.is_none()
+            && !worktree.is_main
+            && !self.project_worktree_paths.contains(&worktree.path)
     }
 
     fn refresh_project_worktree_paths(&mut self, window: &mut Window, cx: &mut App) {
@@ -818,6 +955,14 @@ impl PickerDelegate for WorktreePickerDelegate {
             !self.has_multiple_repositories && self.default_branch.is_some();
         let default_branch = self.default_branch.clone();
 
+        if query.is_empty()
+            && let Some(listed) = &self.listed_worktrees
+        {
+            self.matches = self.listed_matches(listed);
+            self.sync_selected_index(false);
+            return Task::ready(());
+        }
+
         if query.is_empty() {
             let mut matches = self.build_fixed_entries();
 
@@ -874,12 +1019,7 @@ impl PickerDelegate for WorktreePickerDelegate {
         let candidates: Vec<_> = repo_worktrees
             .iter()
             .enumerate()
-            .map(|(ix, worktree)| {
-                StringMatchCandidate::new(
-                    ix,
-                    &worktree.directory_name(worktree_name_anchor.as_deref()),
-                )
-            })
+            .map(|(ix, worktree)| StringMatchCandidate::new(ix, &self.display_name(worktree)))
             .collect();
 
         let executor = cx.background_executor().clone();
@@ -1010,8 +1150,7 @@ impl PickerDelegate for WorktreePickerDelegate {
                                     workspace,
                                     &SwitchWorktree {
                                         path: worktree.path.clone(),
-                                        display_name: worktree
-                                            .directory_name(self.worktree_name_anchor()),
+                                        display_name: self.display_name(worktree),
                                     },
                                     window,
                                     self.focused_dock,
@@ -1121,7 +1260,7 @@ impl PickerDelegate for WorktreePickerDelegate {
                 worktree,
                 positions,
             } => {
-                let display_name = worktree.directory_name(self.worktree_name_anchor());
+                let display_name = self.display_name(worktree);
                 let first_line = display_name.lines().next().unwrap_or(&display_name);
                 let positions: Vec<_> = positions
                     .iter()
@@ -1664,7 +1803,6 @@ mod tests {
     use project::project_settings::ProjectSettings;
     use project::{Project, WorktreeSettings};
     use serde_json::json;
-    use settings::Settings as _;
     use settings::SettingsStore;
     use util::path;
     use workspace::MultiWorkspace;
@@ -2088,6 +2226,100 @@ mod tests {
             !repo_contains_worktree(&repository, &worktree_path, &mut cx).await,
             "worktree should be removed by explicit force delete"
         );
+    }
+
+    #[gpui::test]
+    async fn test_listed_worktrees_replace_the_git_worktree_list(cx: &mut TestAppContext) {
+        let (_fs, worktree_picker, _repository, _worktree_path, mut cx) =
+            init_worktree_picker_test(cx).await;
+        let listed = vec![
+            ListedWorktree {
+                path: PathBuf::from(path!("/root/project")),
+                name: "project".into(),
+                branch: Some("main".into()),
+                section: None,
+            },
+            ListedWorktree {
+                path: PathBuf::from(path!("/root/other.worktrees/1")),
+                name: "other/1".into(),
+                branch: Some("feature".into()),
+                section: Some("main/abc: Feature".into()),
+            },
+        ];
+
+        worktree_picker.update_in(&mut cx, |worktree_picker, window, cx| {
+            worktree_picker.picker.update(cx, |picker, cx| {
+                picker.delegate.all_worktrees =
+                    listed.iter().map(ListedWorktree::git_worktree).collect();
+                picker.delegate.listed_worktrees = Some(Ok(listed.clone()));
+                picker.refresh(window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        worktree_picker.update(&mut cx, |worktree_picker, cx| {
+            worktree_picker.picker.update(cx, |picker, _| {
+                let delegate = &picker.delegate;
+                let listed_rows: Vec<String> = delegate
+                    .matches
+                    .iter()
+                    .skip_while(|entry| !matches!(entry, WorktreeEntry::Separator))
+                    .map(|entry| match entry {
+                        WorktreeEntry::Separator => "---".to_string(),
+                        WorktreeEntry::SectionHeader(label) => format!("# {label}"),
+                        WorktreeEntry::Worktree { worktree, .. } => format!(
+                            "{} {}",
+                            delegate.display_name(worktree),
+                            worktree.branch_name().unwrap_or_default()
+                        ),
+                        _ => "create".to_string(),
+                    })
+                    .collect();
+                assert_eq!(
+                    listed_rows,
+                    [
+                        "---",
+                        "project main",
+                        "---",
+                        "# main/abc: Feature",
+                        "other/1 feature"
+                    ]
+                );
+                assert!(
+                    delegate
+                        .all_worktrees
+                        .iter()
+                        .all(|worktree| !delegate.can_delete_worktree(worktree))
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn test_worktree_list_command_receives_window_folders_and_reports_failures() {
+        let printer = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            r#"printf '[{"path":"%s","name":"n","branch":null,"section":"s"}]' "$1""#.to_string(),
+            "sh".to_string(),
+        ];
+        let listed =
+            futures::executor::block_on(run_worktree_list_command(&printer, &["/w".into()]))
+                .unwrap();
+        assert_eq!(
+            listed,
+            [ListedWorktree {
+                path: "/w".into(),
+                name: "n".into(),
+                branch: None,
+                section: Some("s".into()),
+            }]
+        );
+
+        let failing = ["/bin/sh", "-c", "echo broken >&2; exit 3"].map(String::from);
+        let error =
+            futures::executor::block_on(run_worktree_list_command(&failing, &[])).unwrap_err();
+        assert!(format!("{error:#}").contains("broken"), "{error:#}");
     }
 
     #[gpui::test]

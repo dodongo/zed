@@ -613,6 +613,16 @@ pub struct GitSettings {
     ///
     /// Default: ../worktrees
     pub worktree_directory: Option<String>,
+    /// A command whose output replaces the git worktree list in the worktree
+    /// picker. The first element is the program (a leading `~/` expands to
+    /// the home directory) and the rest are arguments; the paths of the
+    /// window's folders are appended. The command prints a JSON array of
+    /// `{"path": string, "name": string, "branch": string | null,
+    /// "section": string | null}`; consecutive entries with the same
+    /// non-null section appear under a header with that text.
+    ///
+    /// Default: null
+    pub worktree_list_command: Option<Vec<String>>,
 }
 
 #[with_fallible_options]

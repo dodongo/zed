@@ -503,6 +503,11 @@ pub struct GitSettings {
     ///
     /// Default: ../worktrees
     pub worktree_directory: String,
+    /// A command whose output replaces the git worktree list in the worktree
+    /// picker, with the window's folder paths appended.
+    ///
+    /// Default: None
+    pub worktree_list_command: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -719,6 +724,7 @@ impl Settings for ProjectSettings {
                 .worktree_directory
                 .clone()
                 .unwrap_or_else(|| DEFAULT_WORKTREE_DIRECTORY.to_string()),
+            worktree_list_command: git.worktree_list_command.clone(),
         };
         Self {
             context_servers: project
