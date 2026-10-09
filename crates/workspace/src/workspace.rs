@@ -1323,6 +1323,12 @@ pub struct ActiveWorktreeCreation {
 
 /// Captured workspace state used when switching between worktrees.
 /// Stores the layout and open files so they can be restored in the new workspace.
+/// A workspace's dock layout, from `Workspace::dock_layout`.
+pub struct DockLayout {
+    structure: DockStructure,
+    panel_sizes: [Vec<(&'static str, PanelSizeState)>; 3],
+}
+
 pub struct PreviousWorkspaceState {
     pub dock_structure: DockStructure,
     pub open_file_paths: Vec<PathBuf>,
@@ -2501,6 +2507,32 @@ impl Workspace {
             dock.update(cx, |dock, cx| {
                 dock.restore_serialized_state(data, window, cx);
             });
+        }
+    }
+
+    /// The open state, active panels, and panel sizes of this workspace's docks.
+    pub fn dock_layout(&self, window: &Window, cx: &App) -> DockLayout {
+        DockLayout {
+            structure: self.capture_dock_state(window, cx),
+            panel_sizes: [&self.left_dock, &self.bottom_dock, &self.right_dock]
+                .map(|dock| dock.read(cx).panel_size_states()),
+        }
+    }
+
+    /// Applies a layout from `dock_layout`, usually another workspace's.
+    pub fn set_dock_layout(&self, layout: DockLayout, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_dock_structure(layout.structure, window, cx);
+        for (dock, size_states) in [&self.left_dock, &self.bottom_dock, &self.right_dock]
+            .into_iter()
+            .zip(layout.panel_sizes)
+        {
+            for (panel_key, size_state) in size_states {
+                if dock.update(cx, |dock, cx| {
+                    dock.set_keyed_panel_size_state(panel_key, size_state, cx)
+                }) {
+                    self.persist_panel_size_state(panel_key, size_state, cx);
+                }
+            }
         }
     }
 
@@ -14590,6 +14622,49 @@ mod tests {
             let right_dock = workspace.dock_at_position(DockPosition::Right);
             assert!(!left_dock.read(cx).is_open());
             assert!(right_dock.read(cx).is_open());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_dock_layout_carries_open_docks_and_panel_sizes(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let source = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let target_project = Project::test(fs, [], cx).await;
+        let target = multi_workspace.update_in(cx, |mw, window, cx| {
+            mw.test_add_workspace(target_project, window, cx)
+        });
+        for workspace in [&source, &target] {
+            workspace.update_in(cx, |workspace, window, cx| {
+                let panel = cx.new(|cx| TestPanel::new(DockPosition::Right, 100, cx));
+                workspace.add_panel(panel, window, cx);
+            });
+        }
+        let size_state = dock::PanelSizeState {
+            size: Some(px(432.)),
+            flex: None,
+        };
+        source.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_dock(DockPosition::Right, window, cx);
+            workspace.set_panel_size_state::<TestPanel>(size_state, window, cx);
+        });
+
+        let layout = source.update_in(cx, |workspace, window, cx| {
+            workspace.dock_layout(window, cx)
+        });
+        target.update_in(cx, |workspace, window, cx| {
+            workspace.set_dock_layout(layout, window, cx);
+        });
+
+        target.read_with(cx, |workspace, cx| {
+            assert!(workspace.right_dock().read(cx).is_open());
+            assert_eq!(
+                workspace.panel_size_state::<TestPanel>(cx),
+                Some(size_state)
+            );
         });
     }
 

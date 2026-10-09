@@ -1034,6 +1034,33 @@ impl Dock {
         }
     }
 
+    /// Each panel's size state, by panel key.
+    pub fn panel_size_states(&self) -> Vec<(&'static str, PanelSizeState)> {
+        self.panel_entries
+            .iter()
+            .map(|entry| (entry.panel.panel_key(), entry.size_state))
+            .collect()
+    }
+
+    /// Sets the size state of the panel with this panel key; returns whether the dock has it.
+    pub fn set_keyed_panel_size_state(
+        &mut self,
+        panel_key: &str,
+        size_state: PanelSizeState,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(entry) = self
+            .panel_entries
+            .iter_mut()
+            .find(|entry| entry.panel.panel_key() == panel_key)
+        else {
+            return false;
+        };
+        entry.size_state = size_state;
+        cx.notify();
+        true
+    }
+
     pub fn set_panel_size_state(
         &mut self,
         panel: &dyn PanelHandle,

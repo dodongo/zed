@@ -1350,6 +1350,20 @@ async fn open_worktree_workspace(
         })?;
     }
 
+    // Keep the dock layout and panel sizes across the switch, so docked
+    // panels such as the terminal keep their size.
+    if activate
+        && let Some(source) = workspace.upgrade()
+        && source != new_workspace
+    {
+        window_handle.update(cx, |_multi_workspace, window, cx| {
+            let layout = source.read(cx).dock_layout(window, cx);
+            new_workspace.update(cx, |new_workspace, cx| {
+                new_workspace.set_dock_layout(layout, window, cx);
+            });
+        })?;
+    }
+
     // Clear the creation status on the SOURCE workspace so its title bar
     // stops showing the loading indicator immediately.
     workspace
