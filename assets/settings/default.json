@@ -2232,6 +2232,9 @@
   "auto_install_extensions": {
     "html": true,
   },
+  // Whether to offer to install the recommended extension for a file type
+  // when opening a file of that type.
+  "suggest_extensions": true,
   // The capabilities granted to extensions.
   //
   // This list can be customized to restrict what extensions are able to do.

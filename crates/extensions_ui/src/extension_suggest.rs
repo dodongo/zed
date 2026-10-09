@@ -3,9 +3,10 @@ use std::sync::{Arc, OnceLock};
 
 use db::kvp::KeyValueStore;
 use editor::Editor;
-use extension_host::ExtensionStore;
+use extension_host::{ExtensionSettings, ExtensionStore};
 use gpui::{AppContext as _, Context, Entity, SharedString, Window};
 use language::Buffer;
+use settings::Settings as _;
 use ui::prelude::*;
 use util::ResultExt;
 use util::rel_path::RelPath;
@@ -136,6 +137,9 @@ fn language_extension_key(extension_id: &str) -> String {
 }
 
 pub(crate) fn suggest(buffer: Entity<Buffer>, window: &mut Window, cx: &mut Context<Workspace>) {
+    if !ExtensionSettings::get_global(cx).suggest_extensions {
+        return;
+    }
     let Some(file) = buffer.read(cx).file().cloned() else {
         return;
     };

@@ -15,6 +15,8 @@ pub struct ExtensionSettings {
     /// Default: { "html": true }
     pub auto_install_extensions: HashMap<Arc<str>, bool>,
     pub auto_update_extensions: HashMap<Arc<str>, bool>,
+    /// Whether to offer the recommended extension for an opened file's type.
+    pub suggest_extensions: bool,
     pub granted_capabilities: Vec<ExtensionCapability>,
 }
 
@@ -40,6 +42,7 @@ impl Settings for ExtensionSettings {
         Self {
             auto_install_extensions: content.extension.auto_install_extensions.clone(),
             auto_update_extensions: content.extension.auto_update_extensions.clone(),
+            suggest_extensions: content.extension.suggest_extensions.unwrap_or(true),
             granted_capabilities: content
                 .extension
                 .granted_extension_capabilities
