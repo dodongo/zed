@@ -29,9 +29,10 @@ use util::{ResultExt, TryFutureExt, defer};
 use workspace::{
     ActivateNextPane, ActivatePane, ActivatePaneDown, ActivatePaneLeft, ActivatePaneRight,
     ActivatePaneUp, ActivatePreviousPane, DraggedTab, ItemId, MoveItemToPane,
-    MoveItemToPaneInDirection, MovePaneDown, MovePaneLeft, MovePaneRight, MovePaneUp, Pane,
-    PaneGroup, SaveIntent, SplitDirection, SplitDown, SplitLeft, SplitMode, SplitRight, SplitUp,
-    SwapPaneDown, SwapPaneLeft, SwapPaneRight, SwapPaneUp, ToggleZoom, Workspace,
+    MoveItemToPaneInDirection, MovePaneDown, MovePaneLeft, MovePaneRight, MovePaneUp,
+    MultiWorkspace, Pane, PaneGroup, SaveIntent, SplitDirection, SplitDown, SplitLeft, SplitMode,
+    SplitRight, SplitUp, SwapPaneDown, SwapPaneLeft, SwapPaneRight, SwapPaneUp, ToggleZoom,
+    Workspace,
     dock::{DockPosition, Panel, PanelEvent, PanelHandle},
     item::SerializableItem,
     move_active_item, pane,
@@ -342,7 +343,9 @@ impl TerminalPanel {
             self.serialize(cx);
         }
         cx.notify();
-        if self.active && self.has_no_terminals(cx) {
+        if self.active && self.has_no_terminals(cx) && self.share_window_terminals(window, cx) {
+            None
+        } else if self.active && self.has_no_terminals(cx) {
             let working_directory = self
                 .workspace
                 .update(cx, |workspace, cx| default_working_directory(workspace, cx))
@@ -1250,6 +1253,77 @@ impl TerminalPanel {
         })
     }
 
+    /// Shows the terminals of the window's most recently displayed other
+    /// workspace that has any, so switching workspaces in a window keeps its
+    /// terminal sessions instead of starting new ones. Returns whether it
+    /// added any.
+    fn share_window_terminals(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return false;
+        };
+        let Some(multi_workspace) = window.root::<MultiWorkspace>().flatten() else {
+            return false;
+        };
+        let source = multi_workspace
+            .read(cx)
+            .other_workspaces_by_recency(&workspace)
+            .into_iter()
+            .find_map(|other| {
+                let pane = other
+                    .read(cx)
+                    .panel::<TerminalPanel>(cx)?
+                    .read(cx)
+                    .active_pane
+                    .clone();
+                let pane = pane.read(cx);
+                let terminals: Vec<Entity<Terminal>> = pane
+                    .items()
+                    .filter_map(|item| item.downcast::<TerminalView>())
+                    .map(|view| view.read(cx).terminal().clone())
+                    .collect();
+                let active = pane
+                    .active_item()
+                    .and_then(|item| item.downcast::<TerminalView>())
+                    .map(|view| view.read(cx).terminal().entity_id());
+                let active_index = terminals
+                    .iter()
+                    .position(|terminal| Some(terminal.entity_id()) == active)
+                    .unwrap_or(0);
+                (!terminals.is_empty()).then_some((terminals, active_index))
+            });
+        let Some((terminals, active_index)) = source else {
+            return false;
+        };
+        let (weak_workspace, database_id, project) = {
+            let workspace = workspace.read(cx);
+            (
+                workspace.weak_handle(),
+                workspace.database_id(),
+                workspace.project().downgrade(),
+            )
+        };
+        let pane = self.active_pane.clone();
+        for terminal in terminals {
+            let view = cx.new(|cx| {
+                TerminalView::new(
+                    terminal,
+                    weak_workspace.clone(),
+                    database_id,
+                    project.clone(),
+                    window,
+                    cx,
+                )
+            });
+            pane.update(cx, |pane, cx| {
+                pane.add_item(Box::new(view), false, false, None, window, cx);
+            });
+        }
+        pane.update(cx, |pane, cx| {
+            pane.activate_item(active_index, false, false, window, cx);
+        });
+        true
+    }
+
     fn has_no_terminals(&self, cx: &App) -> bool {
         self.active_pane.read(cx).items_len() == 0 && self.pending_terminals_to_add == 0
     }
@@ -1875,6 +1949,9 @@ impl Panel for TerminalPanel {
             return;
         }
         cx.defer_in(window, |this, window, cx| {
+            if !this.has_no_terminals(cx) || this.share_window_terminals(window, cx) {
+                return;
+            }
             let Ok(kind) = this
                 .workspace
                 .update(cx, |workspace, cx| default_working_directory(workspace, cx))
@@ -3065,6 +3142,67 @@ mod tests {
                 });
             })
             .expect("Failed to read configured terminal panel starts_open");
+    }
+
+    #[gpui::test]
+    async fn test_another_workspace_in_the_window_shows_the_same_terminal(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let (window_handle, first_panel) = init_workspace_with_panel(cx).await;
+        window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    TerminalPanel::new_terminal(
+                        workspace,
+                        &workspace::NewTerminal::default(),
+                        window,
+                        cx,
+                    );
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let first_terminals = first_panel.read_with(cx, |panel, cx| {
+            panel
+                .active_pane
+                .read(cx)
+                .items()
+                .filter_map(|item| item.downcast::<TerminalView>())
+                .map(|view| view.read(cx).terminal().entity_id())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(first_terminals.len(), 1);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let second_panel = window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.test_add_workspace(project, window, cx);
+                workspace.update(cx, |workspace, cx| {
+                    let panel = cx.new(|cx| TerminalPanel::new(workspace, window, cx));
+                    workspace.add_panel(panel.clone(), window, cx);
+                    panel
+                })
+            })
+            .unwrap();
+        window_handle
+            .update(cx, |_, window, cx| {
+                second_panel.update(cx, |panel, cx| panel.set_active(true, window, cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let second_terminals = second_panel.read_with(cx, |panel, cx| {
+            panel
+                .active_pane
+                .read(cx)
+                .items()
+                .filter_map(|item| item.downcast::<TerminalView>())
+                .map(|view| view.read(cx).terminal().entity_id())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(second_terminals, first_terminals);
     }
 
     #[gpui::test]
