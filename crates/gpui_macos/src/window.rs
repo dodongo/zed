@@ -1202,7 +1202,17 @@ impl MacWindow {
                     let main_window_visible: BOOL = msg_send![main_window, isVisible];
 
                     if main_window_can_tab == YES && main_window_visible == YES {
-                        let _: () = msg_send![main_window, addTabbedWindow: native_window ordered: NSWindowOrderingMode::NSWindowAbove];
+                        // Append after the group's last tab rather than after the main
+                        // window, so tabs keep their opening order however focus moves
+                        // while windows open, as during session restore.
+                        let tabbed_windows: id = msg_send![main_window, tabbedWindows];
+                        let last_tab: id = if tabbed_windows.is_null() {
+                            nil
+                        } else {
+                            msg_send![tabbed_windows, lastObject]
+                        };
+                        let anchor = if last_tab.is_null() { main_window } else { last_tab };
+                        let _: () = msg_send![anchor, addTabbedWindow: native_window ordered: NSWindowOrderingMode::NSWindowAbove];
 
                         // Ensure the window is visible immediately after adding the tab, since the tab bar is updated with a new entry at this point.
                         // Note: Calling orderFront here can break fullscreen mode (makes fullscreen windows exit fullscreen), so only do this if the main window is not fullscreen.
