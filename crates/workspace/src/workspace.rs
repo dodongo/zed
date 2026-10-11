@@ -250,10 +250,22 @@ fn parse_window_status(contents: &str) -> WindowStatus {
     }
 }
 
+/// The folder name of the main worktree when `worktree` is a linked git worktree.
+fn main_worktree_name<'a>(project: &Project, worktree: &Worktree, cx: &'a App) -> Option<&'a str> {
+    project.repositories(cx).values().find_map(|repository| {
+        let repository = repository.read(cx);
+        (repository.is_linked_worktree()
+            && *repository.work_directory_abs_path == *worktree.abs_path())
+        .then(|| repository.main_worktree_abs_path()?.file_name()?.to_str())
+        .flatten()
+    })
+}
+
 fn workspace_identity_emoji(project: &Project, cx: &App) -> Option<&'static str> {
     let worktree = project.visible_worktrees(cx).next()?;
     let worktree = worktree.read(cx);
-    let name = worktree.root_name_str();
+    // A linked worktree shares its main worktree's family, so its slots look related.
+    let name = main_worktree_name(project, worktree, cx).unwrap_or(worktree.root_name_str());
     let family_index = if name.starts_with("mobile-platform-ios") {
         0
     } else if name.starts_with("gaming-native") {
@@ -6692,14 +6704,7 @@ impl Workspace {
                 title.push_str(", ");
             }
             // Name a linked git worktree after its main worktree too, as "main/linked".
-            let main_worktree_name = project.repositories(cx).values().find_map(|repository| {
-                let repository = repository.read(cx);
-                (repository.is_linked_worktree()
-                    && *repository.work_directory_abs_path == *worktree.abs_path())
-                .then(|| repository.main_worktree_abs_path()?.file_name()?.to_str())
-                .flatten()
-            });
-            if let Some(main_worktree_name) = main_worktree_name {
+            if let Some(main_worktree_name) = main_worktree_name(project, worktree, cx) {
                 title.push_str(main_worktree_name);
                 title.push('/');
             }
