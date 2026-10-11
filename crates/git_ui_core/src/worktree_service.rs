@@ -1235,28 +1235,32 @@ async fn open_worktree_workspace(
         task.await.log_err();
     }
 
-    new_workspace
-        .update(cx, |workspace, cx| {
-            workspace.project().read(cx).wait_for_initial_scan(cx)
-        })
-        .await;
+    // Remapping open files needs the scanned worktree and its git state. A
+    // plain switch shows the workspace right away and lets them load in place.
+    if transfer_state {
+        new_workspace
+            .update(cx, |workspace, cx| {
+                workspace.project().read(cx).wait_for_initial_scan(cx)
+            })
+            .await;
 
-    new_workspace
-        .update(cx, |workspace, cx| {
-            let repos = workspace
-                .project()
-                .read(cx)
-                .repositories(cx)
-                .values()
-                .cloned()
-                .collect::<Vec<_>>();
+        new_workspace
+            .update(cx, |workspace, cx| {
+                let repos = workspace
+                    .project()
+                    .read(cx)
+                    .repositories(cx)
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
 
-            let tasks = repos
-                .into_iter()
-                .map(|repo| repo.update(cx, |repo, _| repo.barrier()));
-            futures::future::join_all(tasks)
-        })
-        .await;
+                let tasks = repos
+                    .into_iter()
+                    .map(|repo| repo.update(cx, |repo, _| repo.barrier()));
+                futures::future::join_all(tasks)
+            })
+            .await;
+    }
 
     maybe_propagate_worktree_trust(&workspace, &new_workspace, &all_paths, cx);
 
