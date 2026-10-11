@@ -1,5 +1,5 @@
 use db::kvp::KeyValueStore;
-use gpui::{App, AppContext as _, Context, Subscription, Task, WindowId};
+use gpui::{App, AppContext as _, Context, Subscription, SystemWindowTabController, Task, WindowId};
 use util::ResultExt;
 
 pub struct Session {
@@ -74,6 +74,7 @@ impl Session {
 pub struct AppSession {
     session: Session,
     workspace_restore: WorkspaceRestoreState,
+    window_order_frozen: bool,
     _serialization_task: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -99,15 +100,19 @@ impl AppSession {
 
         let _serialization_task = if cfg!(not(any(test, feature = "test-support"))) {
             let db = KeyValueStore::global(cx);
-            cx.spawn(async move |_, cx| {
+            cx.spawn(async move |this, cx| {
                 // Disabled in tests: the infinite loop bypasses "parking forbidden" checks,
                 // causing tests to hang instead of panicking.
                 {
                     let mut current_window_stack = Vec::new();
                     let mut current_window_open_order = Vec::new();
                     loop {
-                        if let Some((window_stack, window_open_order)) =
-                            cx.update(|cx| Some((window_stack(cx)?, window_open_order(cx))))
+                        let frozen = this
+                            .read_with(cx, |session, _| session.window_order_frozen)
+                            .unwrap_or(true);
+                        if !frozen
+                            && let Some((window_stack, window_open_order)) =
+                                cx.update(|cx| Some((window_stack(cx)?, window_open_order(cx))))
                             && !window_stack.is_empty()
                         {
                             if window_stack != current_window_stack {
@@ -143,12 +148,34 @@ impl AppSession {
         Self {
             session,
             workspace_restore: WorkspaceRestoreState::default(),
+            window_order_frozen: false,
             _subscriptions,
             _serialization_task,
         }
     }
 
     fn app_will_quit(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        if self.window_order_frozen {
+            return Task::ready(());
+        }
+        self.store_window_order(cx)
+    }
+
+    /// Saves the current window order and stops tracking it, so windows
+    /// brought forward while preparing to quit don't replace the window the
+    /// user had selected.
+    pub fn freeze_window_order(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        let task = self.store_window_order(cx);
+        self.window_order_frozen = true;
+        task
+    }
+
+    /// Resumes tracking the window order after a cancelled quit.
+    pub fn unfreeze_window_order(&mut self) {
+        self.window_order_frozen = false;
+    }
+
+    fn store_window_order(&self, cx: &App) -> Task<()> {
         if let Some(window_stack) = window_stack(cx)
             && !window_stack.is_empty()
         {
@@ -206,11 +233,22 @@ fn window_stack(cx: &App) -> Option<Vec<u64>> {
     )
 }
 
+/// Windows in creation order, with each tab group in its tab bar order, so
+/// restored tabs keep the order the user arranged.
 fn window_open_order(cx: &App) -> Vec<u64> {
-    cx.windows()
-        .into_iter()
-        .map(|window| window.window_id().as_u64())
-        .collect()
+    let tab_controller = cx.try_global::<SystemWindowTabController>();
+    let mut order = Vec::new();
+    for window in cx.windows() {
+        let id = window.window_id();
+        if order.contains(&id.as_u64()) {
+            continue;
+        }
+        match tab_controller.and_then(|controller| controller.tabs(id)) {
+            Some(tabs) => order.extend(tabs.iter().map(|tab| tab.id.as_u64())),
+            None => order.push(id.as_u64()),
+        }
+    }
+    order
 }
 
 async fn store_window_ids(db: KeyValueStore, key: &'static str, windows: &[u64]) {

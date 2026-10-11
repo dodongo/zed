@@ -11618,6 +11618,15 @@ pub async fn prepare_windows_to_quit(
     workspace_windows: &[WindowHandle<MultiWorkspace>],
     cx: &mut AsyncApp,
 ) -> bool {
+    // Preparing brings each window forward, so save the user's selected
+    // window first and keep it as the one to restore.
+    let session = cx.update(|cx| AppState::try_global(cx).map(|state| state.session.clone()));
+    if let Some(session) = &session {
+        session
+            .update(cx, |session, cx| session.freeze_window_order(cx))
+            .await;
+    }
+
     // If the user cancels any save prompt, then keep the app open.
     let mut prepared_windows = Vec::new();
     let mut cancelled = false;
@@ -11640,6 +11649,9 @@ pub async fn prepare_windows_to_quit(
     }
 
     if cancelled {
+        if let Some(session) = &session {
+            session.update(cx, |session, _| session.unfreeze_window_order());
+        }
         flush_windows_serialization(&prepared_windows, cx).await;
         for window in prepared_windows {
             window
