@@ -100,6 +100,7 @@ use project::{
     DirectoryLister, Project, ProjectEntryId, ProjectPath, ResolvedPath, Worktree, WorktreeId,
     WorktreeSettings,
     debugger::{breakpoint_store::BreakpointStoreEvent, session::ThreadStatus},
+    git_store::{GitStoreEvent, RepositoryEvent},
     project_settings::ProjectSettings,
     toolchain_store::ToolchainStoreEvent,
     trusted_worktrees::{RemoteHostLocation, TrustedWorktrees, TrustedWorktreesEvent},
@@ -1850,6 +1851,20 @@ impl Workspace {
             }
             cx.notify()
         })
+        .detach();
+
+        // The window title names the active repository's branch, so it follows branch changes.
+        cx.subscribe_in(
+            &project.read(cx).git_store().clone(),
+            window,
+            |workspace, _, event, window, cx| match event {
+                GitStoreEvent::ActiveRepositoryChanged(_)
+                | GitStoreEvent::RepositoryUpdated(_, RepositoryEvent::HeadChanged, true) => {
+                    workspace.update_window_title(window, cx);
+                }
+                _ => {}
+            },
+        )
         .detach();
 
         cx.subscribe_in(
@@ -18604,6 +18619,35 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         assert_eq!(cx.window_title().as_deref(), Some(root1_title.as_str()));
+    }
+
+    #[gpui::test]
+    async fn test_window_title_follows_branch_changes(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({ ".git": {}, "a.txt": "" }))
+            .await;
+        let dot_git = Path::new(path!("/root/.git"));
+        fs.set_branch_name(dot_git, Some("main"));
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let prefix = project.read_with(cx, |project, cx| {
+            format!("◯ {} root", workspace_identity_emoji(project, cx).unwrap())
+        });
+        let multi_workspace_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let cx = &mut VisualTestContext::from_window(multi_workspace_handle.into(), cx);
+        cx.run_until_parked();
+        assert_eq!(cx.window_title(), Some(format!("{prefix} [main]")));
+
+        fs.set_branch_name(dot_git, Some("feature"));
+        cx.run_until_parked();
+        assert_eq!(cx.window_title(), Some(format!("{prefix} [feature]")));
+
+        // A detached HEAD has no branch to name.
+        fs.set_branch_name(dot_git, None::<String>);
+        cx.run_until_parked();
+        assert_eq!(cx.window_title(), Some(prefix));
     }
 
     #[gpui::test]
