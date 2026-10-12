@@ -208,12 +208,15 @@ fn should_apply_default_new_workspace_layout(
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct WindowStatus {
     emoji: String,
+    /// The worktree the window's Herdr session selected, which the window follows.
+    worktree: Option<PathBuf>,
 }
 
 impl Default for WindowStatus {
     fn default() -> Self {
         Self {
             emoji: "◯".to_string(),
+            worktree: None,
         }
     }
 }
@@ -221,6 +224,7 @@ impl Default for WindowStatus {
 #[derive(Deserialize)]
 struct WindowStatusFile {
     state: Option<String>,
+    worktree: Option<PathBuf>,
 }
 
 fn parse_window_status(contents: &str) -> WindowStatus {
@@ -231,42 +235,46 @@ fn parse_window_status(contents: &str) -> WindowStatus {
     let Ok(file) = serde_json::from_str::<WindowStatusFile>(contents) else {
         return WindowStatus {
             emoji: "⚠️".to_string(),
+            worktree: None,
         };
     };
 
-    match file.state.as_deref() {
-        Some("idle") | None => WindowStatus::default(),
-        Some("running") => WindowStatus {
-            emoji: "◐".to_string(),
-        },
-        Some("success") => WindowStatus {
-            emoji: "◉".to_string(),
-        },
-        Some("failure") | Some("failed") => WindowStatus {
-            emoji: "⊗".to_string(),
-        },
-        Some(_) => WindowStatus {
-            emoji: "⚠️".to_string(),
-        },
+    let emoji = match file.state.as_deref() {
+        Some("idle") | None => "◯",
+        Some("running") => "◐",
+        Some("success") => "◉",
+        Some("failure") | Some("failed") => "⊗",
+        Some(_) => "⚠️",
+    };
+    WindowStatus {
+        emoji: emoji.to_string(),
+        worktree: file.worktree,
     }
 }
 
-/// The folder name of the main worktree when `worktree` is a linked git worktree.
-fn main_worktree_name<'a>(project: &Project, worktree: &Worktree, cx: &'a App) -> Option<&'a str> {
+/// The main worktree's path when `worktree` is a linked git worktree. The window
+/// title and identity emoji name the main worktree, so a linked worktree's window
+/// looks like its main worktree's window.
+fn main_worktree_path<'a>(project: &Project, worktree: &Worktree, cx: &'a App) -> Option<&'a Path> {
     project.repositories(cx).values().find_map(|repository| {
         let repository = repository.read(cx);
         (repository.is_linked_worktree()
             && *repository.work_directory_abs_path == *worktree.abs_path())
-        .then(|| repository.main_worktree_abs_path()?.file_name()?.to_str())
+        .then(|| repository.main_worktree_abs_path())
         .flatten()
     })
+}
+
+fn main_worktree_name<'a>(project: &Project, worktree: &'a Worktree, cx: &'a App) -> &'a str {
+    main_worktree_path(project, worktree, cx)
+        .and_then(|path| path.file_name()?.to_str())
+        .unwrap_or(worktree.root_name_str())
 }
 
 fn workspace_identity_emoji(project: &Project, cx: &App) -> Option<&'static str> {
     let worktree = project.visible_worktrees(cx).next()?;
     let worktree = worktree.read(cx);
-    // A linked worktree shares its main worktree's family, so its slots look related.
-    let name = main_worktree_name(project, worktree, cx).unwrap_or(worktree.root_name_str());
+    let name = main_worktree_name(project, worktree, cx);
     let family_index = if name.starts_with("mobile-platform-ios") {
         0
     } else if name.starts_with("gaming-native") {
@@ -275,7 +283,8 @@ fn workspace_identity_emoji(project: &Project, cx: &App) -> Option<&'static str>
         identity_hash(name) % IDENTITY_EMOJI_FAMILIES.len()
     };
     let family = IDENTITY_EMOJI_FAMILIES[family_index];
-    let path = worktree.abs_path();
+    let abs_path = worktree.abs_path();
+    let path = main_worktree_path(project, worktree, cx).unwrap_or(&abs_path);
     Some(family[identity_hash(&path.to_string_lossy()) % family.len()])
 }
 
@@ -6660,15 +6669,23 @@ impl Workspace {
 
         self._window_status_watcher = Some(cx.spawn_in(window, async move |this, cx| {
             let _watcher = watcher;
+            // The first read only records the selected worktree, so opening a
+            // workspace never switches away from it.
+            let mut follow_worktree = false;
             while let Some(contents) = status_rx.next().await {
                 let status = parse_window_status(&contents);
+                let follow = std::mem::replace(&mut follow_worktree, true);
                 if this
                     .update_in(cx, |workspace, window, cx| {
                         if workspace.window_status == status {
                             return;
                         }
+                        let worktree_changed = workspace.window_status.worktree != status.worktree;
                         workspace.window_status = status;
-                        workspace.refresh_window_state(window, cx);
+                        workspace.update_window_title(window, cx);
+                        if follow && worktree_changed {
+                            workspace.follow_window_worktree(window, cx);
+                        }
                     })
                     .is_err()
                 {
@@ -6676,6 +6693,36 @@ impl Workspace {
                 }
             }
         }));
+    }
+
+    /// Switches the window to the worktree its Herdr session selected, unless
+    /// this workspace is in the background or already shows that worktree.
+    fn follow_window_worktree(&self, window: &mut Window, cx: &mut App) {
+        let Some(path) = self.window_status.worktree.clone() else {
+            return;
+        };
+        if !self.owns_window_chrome()
+            || self
+                .project
+                .read(cx)
+                .visible_worktrees(cx)
+                .any(|worktree| *worktree.read(cx).abs_path() == *path)
+        {
+            return;
+        }
+        let action = zed_actions::SwitchWorktree {
+            display_name: path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            path,
+        };
+        // The pane's focus handle reaches the workspace's action handlers even
+        // when focus is elsewhere in the window.
+        let pane_focus = self.active_pane.focus_handle(cx);
+        window.defer(cx, move |window, cx| {
+            pane_focus.dispatch_action(&action, window, cx)
+        });
     }
 
     /// Whether this workspace may write the platform window's title and edited
@@ -6713,15 +6760,10 @@ impl Workspace {
 
         for (i, worktree) in project.visible_worktrees(cx).enumerate() {
             let worktree = worktree.read(cx);
-            let name = worktree.root_name_str();
+            let name = main_worktree_name(project, worktree, cx);
 
             if i > 0 {
                 title.push_str(", ");
-            }
-            // Name a linked git worktree after its main worktree too, as "main/linked".
-            if let Some(main_worktree_name) = main_worktree_name(project, worktree, cx) {
-                title.push_str(main_worktree_name);
-                title.push('/');
             }
             title.push_str(name);
         }
@@ -18697,6 +18739,97 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         assert_eq!(cx.window_title().as_deref(), Some(root2_title.as_str()));
+    }
+
+    #[gpui::test]
+    async fn test_linked_worktree_window_title_names_its_main_worktree(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({ ".git": {}, "a.txt": "" }))
+            .await;
+        fs.add_linked_worktree_for_repo(
+            Path::new(path!("/project/.git")),
+            false,
+            git::repository::Worktree {
+                path: PathBuf::from(path!("/project.worktrees/2")),
+                ref_name: Some("refs/heads/feature".into()),
+                sha: "abc123".into(),
+                is_main: false,
+                is_bare: false,
+            },
+        )
+        .await;
+        fs.insert_tree(path!("/project.worktrees/2"), json!({ "a.txt": "" }))
+            .await;
+
+        let main_project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let linked_project =
+            Project::test(fs.clone(), [path!("/project.worktrees/2").as_ref()], cx).await;
+        cx.run_until_parked();
+        let main_emoji =
+            main_project.read_with(cx, |project, cx| workspace_identity_emoji(project, cx));
+        let multi_workspace_handle = cx
+            .add_window(|window, cx| MultiWorkspace::test_new(linked_project.clone(), window, cx));
+        let cx = &mut VisualTestContext::from_window(multi_workspace_handle.into(), cx);
+        cx.run_until_parked();
+
+        assert_eq!(
+            cx.window_title(),
+            Some(format!("◯ {} project", main_emoji.unwrap()))
+        );
+    }
+
+    #[gpui::test]
+    async fn test_window_follows_the_worktree_its_status_selects(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let status_path = Path::new(path!("/root/.zed/window-status.json"));
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "a.txt": "",
+                ".zed": { "window-status.json": r#"{"state": "idle", "worktree": "/opened"}"# },
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let multi_workspace_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let cx = &mut VisualTestContext::from_window(multi_workspace_handle.into(), cx);
+        let switches = Rc::new(RefCell::new(Vec::new()));
+        multi_workspace_handle
+            .update(cx, |multi_workspace, _, cx| {
+                let switches = switches.clone();
+                multi_workspace.workspace().update(cx, |workspace, _| {
+                    workspace.register_action(
+                        move |_, action: &zed_actions::SwitchWorktree, _, _| {
+                            switches.borrow_mut().push(action.path.clone());
+                        },
+                    );
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        // The worktree selected before the window opened stays unfollowed.
+        assert_eq!(*switches.borrow(), Vec::<PathBuf>::new());
+
+        let write_status = async |contents: &str| {
+            fs.write(status_path, contents.as_bytes()).await.unwrap();
+        };
+        write_status(r#"{"state": "idle", "worktree": "/root.worktrees/1"}"#).await;
+        cx.run_until_parked();
+        // A status change that keeps the worktree does not switch again.
+        write_status(r#"{"state": "running", "worktree": "/root.worktrees/1"}"#).await;
+        cx.run_until_parked();
+        // The window already shows its own folder.
+        write_status(&format!(
+            r#"{{"state": "running", "worktree": "{}"}}"#,
+            path!("/root")
+        ))
+        .await;
+        cx.run_until_parked();
+        assert_eq!(*switches.borrow(), vec![PathBuf::from("/root.worktrees/1")]);
     }
 
     fn pane_items_paths(pane: &Entity<Pane>, cx: &App) -> Vec<String> {
