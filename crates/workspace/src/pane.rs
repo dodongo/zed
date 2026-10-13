@@ -2049,11 +2049,12 @@ impl Pane {
                     let Some(pane_handle) = pane.upgrade() else {
                         return Ok(());
                     };
-                    match Self::save_item(
+                    match Self::save_item_internal(
                         project.clone(),
                         pane_handle,
                         &*item_to_close,
                         save_intent,
+                        keep_pane,
                         cx,
                     )
                     .await
@@ -2272,6 +2273,17 @@ impl Pane {
         save_intent: SaveIntent,
         cx: &mut AsyncWindowContext,
     ) -> Result<bool> {
+        Self::save_item_internal(project, pane, item, save_intent, false, cx).await
+    }
+
+    async fn save_item_internal(
+        project: Entity<Project>,
+        pane: Entity<Pane>,
+        item: &dyn ItemHandle,
+        save_intent: SaveIntent,
+        keep_pane: bool,
+        cx: &mut AsyncWindowContext,
+    ) -> Result<bool> {
         const CONFLICT_MESSAGE: &str = "This file has changed on disk since you started editing it. Do you want to overwrite it?";
 
         const DELETED_MESSAGE: &str = "This file has been deleted on disk since you started editing it. Do you want to recreate it?";
@@ -2369,7 +2381,7 @@ impl Pane {
                     }
                     Ok(1) => {
                         pane.update_in(cx, |pane, window, cx| {
-                            pane.remove_item(item.item_id(), false, true, window, cx)
+                            pane.remove_item(item.item_id(), false, !keep_pane, window, cx)
                         })?;
                     }
                     _ => return Ok(false),

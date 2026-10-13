@@ -6899,7 +6899,6 @@ impl Workspace {
             return;
         };
         if self.opening_items || self.restoring_workspace {
-            self.pending_worktree_switch = Some(path);
             return;
         }
         if !self.active_worktree_creation.is_switch
@@ -11699,6 +11698,9 @@ async fn open_remote_project_inner(
         return Err(project_path_errors.pop().context("no paths given")?);
     }
 
+    let db = cx.update(|cx| WorkspaceDb::global(cx));
+    let toolchains = db.toolchains(workspace_id).await?;
+
     let workspace = window.update(cx, |multi_workspace, window, cx| {
         let new_workspace = cx.new(|cx| {
             let mut workspace = Workspace::new(
@@ -11731,8 +11733,6 @@ async fn open_remote_project_inner(
         new_workspace
     })?;
 
-    let db = cx.update(|cx| WorkspaceDb::global(cx));
-    let toolchains = db.toolchains(workspace_id).await?;
     for (toolchain, worktree_path, path) in toolchains {
         project
             .update(cx, |this, cx| {
@@ -18536,9 +18536,16 @@ mod tests {
             let project = Project::test(fs.clone(), [path!("/root/main").as_ref()], cx).await;
             let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
                 let multi_workspace = MultiWorkspace::test_new(project.clone(), window, cx);
-                multi_workspace
-                    .workspace()
-                    .update(cx, |workspace, _| workspace.opening_items = true);
+                multi_workspace.workspace().update(cx, |workspace, _| {
+                    workspace.opening_items = true;
+                    workspace.register_action(
+                        |workspace, action: &zed_actions::SwitchWorktree, window, cx| {
+                            workspace
+                                .switch_worktree_in_place(action.path.clone(), window, cx)
+                                .detach_and_log_err(cx);
+                        },
+                    );
+                });
                 multi_workspace
             });
             let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
@@ -18548,9 +18555,10 @@ mod tests {
             });
             workspace.read_with(cx, |workspace, _| {
                 assert_eq!(
-                    workspace.pending_worktree_switch,
+                    workspace.window_status.worktree,
                     Some(PathBuf::from(path!("/root/slot")))
                 );
+                assert!(workspace.pending_worktree_switch.is_none());
                 assert!(workspace.active_worktree_creation.label.is_none());
             });
             workspace
@@ -18595,6 +18603,57 @@ mod tests {
                     workspace.open_item_abs_paths(cx),
                     vec![PathBuf::from(path!("/root/main/one.png"))]
                 );
+            });
+        }
+
+        #[gpui::test]
+        async fn test_initial_worktree_follow_does_not_switch_a_background_workspace(
+            cx: &mut TestAppContext,
+        ) {
+            init_test(cx);
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree(path!("/root"), json!({
+                "main": { ".zed": { "window-status.json": format!(r#"{{"worktree":"{}"}}"#, path!("/root/slot")) } },
+                "slot": {},
+                "other": {}
+            })).await;
+            let project = Project::test(fs.clone(), [path!("/root/main").as_ref()], cx).await;
+            let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+                let multi_workspace = MultiWorkspace::test_new(project.clone(), window, cx);
+                multi_workspace
+                    .workspace()
+                    .update(cx, |workspace, _| workspace.opening_items = true);
+                multi_workspace
+            });
+            let initial = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+            cx.run_until_parked();
+            let other_project = Project::test(fs, [path!("/root/other").as_ref()], cx).await;
+            let other = multi_workspace.update_in(cx, |mw, window, cx| {
+                let other = mw.test_add_workspace(other_project, window, cx);
+                mw.activate(other.clone(), None, window, cx);
+                other
+            });
+            initial.update_in(cx, |workspace, window, cx| {
+                workspace.opening_items = false;
+                workspace.resume_worktree_following(window, cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(
+                multi_workspace.read_with(cx, |mw, _| mw.workspace().clone()),
+                other
+            );
+            assert_eq!(
+                project.read_with(cx, |project, cx| project
+                    .visible_worktrees(cx)
+                    .next()
+                    .unwrap()
+                    .read(cx)
+                    .abs_path()
+                    .to_path_buf()),
+                PathBuf::from(path!("/root/main"))
+            );
+            initial.read_with(cx, |workspace, _| {
+                assert!(workspace.active_worktree_creation.label.is_none())
             });
         }
 
@@ -19525,6 +19584,51 @@ mod tests {
                 workspace.dock_size(&workspace.right_dock.read(cx), window, cx),
                 width
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_switch_worktree_in_place_preserves_panes_when_closing_deleted_files(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({ "main": {}, "slot": {} }))
+            .await;
+        let project = Project::test(fs, [path!("/root/main").as_ref()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let old_id = project.read_with(cx, |project, cx| {
+            project.visible_worktrees(cx).next().unwrap().read(cx).id()
+        });
+        let panes = workspace.update_in(cx, |workspace, window, cx| {
+            let item = cx.new(|cx| {
+                let mut item = TestItem::new(cx).with_dirty(true).with_project_items(&[
+                    TestProjectItem::new_in_worktree(1, "deleted.txt", old_id, cx),
+                ]);
+                item.has_conflict = true;
+                item.has_deleted_file = true;
+                item
+            });
+            workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+            workspace.split_pane(
+                workspace.active_pane().clone(),
+                SplitDirection::Right,
+                window,
+                cx,
+            );
+            workspace.panes().to_vec()
+        });
+        let switch = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.switch_worktree_in_place(PathBuf::from(path!("/root/slot")), window, cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Close");
+        switch.await.unwrap();
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.panes(), panes);
+            assert_eq!(workspace.center_full_height_column_count(), 2.);
         });
     }
 
