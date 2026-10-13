@@ -2680,6 +2680,11 @@ impl Workspace {
                     this.update(cx, |workspace, _| workspace.pending_worktree_switch.take())?
                 {
                     let project = this.read_with(cx, |workspace, _| workspace.project.clone())?;
+                    if project.read_with(cx, |project, _| project.is_via_collab()) {
+                        return Err(anyhow!(
+                            "Cannot switch worktrees in a collaborative project"
+                        ));
+                    }
                     let old_root =
                         project.read_with(cx, |project, cx| project.visible_worktrees(cx).next());
                     let Some(old_root) = old_root else {
@@ -19498,7 +19503,6 @@ mod tests {
                 window,
                 cx,
             );
-            workspace.bounds.size.width = px(1200.);
             workspace.panes().to_vec()
         });
         let width = workspace.update_in(cx, |workspace, window, cx| {
@@ -19517,7 +19521,6 @@ mod tests {
         workspace.update_in(cx, |workspace, window, cx| {
             assert_eq!(workspace.panes(), panes);
             assert_eq!(workspace.center_full_height_column_count(), 2.);
-            workspace.bounds.size.width = px(1200.);
             assert_eq!(
                 workspace.dock_size(&workspace.right_dock.read(cx), window, cx),
                 width
