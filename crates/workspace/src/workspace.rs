@@ -217,6 +217,8 @@ struct WindowStatus {
     emoji: String,
     /// The worktree the window's Herdr session selected, which the window follows.
     worktree: Option<PathBuf>,
+    /// The Herdr session's project folder, which the window title names whichever worktree it follows.
+    root: Option<PathBuf>,
 }
 
 impl Default for WindowStatus {
@@ -224,6 +226,7 @@ impl Default for WindowStatus {
         Self {
             emoji: "◯".to_string(),
             worktree: None,
+            root: None,
         }
     }
 }
@@ -232,6 +235,7 @@ impl Default for WindowStatus {
 struct WindowStatusFile {
     state: Option<String>,
     worktree: Option<PathBuf>,
+    root: Option<PathBuf>,
 }
 
 fn parse_window_status(contents: &str) -> WindowStatus {
@@ -243,6 +247,7 @@ fn parse_window_status(contents: &str) -> WindowStatus {
         return WindowStatus {
             emoji: "⚠️".to_string(),
             worktree: None,
+            root: None,
         };
     };
 
@@ -256,6 +261,7 @@ fn parse_window_status(contents: &str) -> WindowStatus {
     WindowStatus {
         emoji: emoji.to_string(),
         worktree: file.worktree,
+        root: file.root,
     }
 }
 
@@ -281,7 +287,15 @@ fn main_worktree_name<'a>(project: &Project, worktree: &'a Worktree, cx: &'a App
 fn workspace_identity_emoji(project: &Project, cx: &App) -> Option<&'static str> {
     let worktree = project.visible_worktrees(cx).next()?;
     let worktree = worktree.read(cx);
-    let name = main_worktree_name(project, worktree, cx);
+    let abs_path = worktree.abs_path();
+    let path = main_worktree_path(project, worktree, cx).unwrap_or(&abs_path);
+    Some(identity_emoji(
+        main_worktree_name(project, worktree, cx),
+        path,
+    ))
+}
+
+fn identity_emoji(name: &str, path: &Path) -> &'static str {
     let family_index = if name.starts_with("mobile-platform-ios") {
         0
     } else if name.starts_with("gaming-native") {
@@ -290,9 +304,7 @@ fn workspace_identity_emoji(project: &Project, cx: &App) -> Option<&'static str>
         identity_hash(name) % IDENTITY_EMOJI_FAMILIES.len()
     };
     let family = IDENTITY_EMOJI_FAMILIES[family_index];
-    let abs_path = worktree.abs_path();
-    let path = main_worktree_path(project, worktree, cx).unwrap_or(&abs_path);
-    Some(family[identity_hash(&path.to_string_lossy()) % family.len()])
+    family[identity_hash(&path.to_string_lossy()) % family.len()]
 }
 
 fn identity_hash(value: &str) -> usize {
@@ -1622,6 +1634,8 @@ pub struct Workspace {
     _subscriptions: Vec<Subscription>,
     window_status: WindowStatus,
     _window_status_watcher: Option<Task<()>>,
+    window_root_branch: Option<String>,
+    _window_root_head_watcher: Option<Task<()>>,
     pending_worktree_switch: Option<PathBuf>,
     _apply_leader_updates: Task<Result<()>>,
     _observe_current_user: Task<Result<()>>,
@@ -2116,6 +2130,8 @@ impl Workspace {
             _apply_leader_updates,
             window_status: WindowStatus::default(),
             _window_status_watcher: None,
+            window_root_branch: None,
+            _window_root_head_watcher: None,
             pending_worktree_switch: None,
             _schedule_serialize_workspace: None,
             _serialize_workspace_task: None,
@@ -6864,10 +6880,53 @@ impl Workspace {
                             return;
                         }
                         let worktree_changed = workspace.window_status.worktree != status.worktree;
+                        let root_changed = workspace.window_status.root != status.root;
                         workspace.window_status = status;
+                        if root_changed {
+                            workspace.watch_window_root_head(window, cx);
+                        }
                         workspace.update_window_title(window, cx);
                         if worktree_changed {
                             workspace.follow_window_worktree(window, cx);
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// Keeps the window title's branch on the status root's checked-out branch.
+    fn watch_window_root_head(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.window_root_branch = None;
+        self._window_root_head_watcher = None;
+        let Some(root) = self.window_status.root.clone() else {
+            return;
+        };
+        let fs = self.project.read(cx).fs().clone();
+        let executor = cx.background_executor().clone();
+        self._window_root_head_watcher = Some(cx.spawn_in(window, async move |this, cx| {
+            let dot_git = root.join(".git");
+            let git_dir = match fs.load(&dot_git).await {
+                Ok(contents) => match contents.trim().strip_prefix("gitdir:") {
+                    Some(dir) => root.join(dir.trim()),
+                    None => return,
+                },
+                Err(_) => dot_git,
+            };
+            let (mut head_rx, _watcher) = watch_config_file(&executor, fs, git_dir.join("HEAD"));
+            while let Some(head) = head_rx.next().await {
+                let branch = head
+                    .trim()
+                    .strip_prefix("ref: refs/heads/")
+                    .map(str::to_owned);
+                if this
+                    .update_in(cx, |workspace, window, cx| {
+                        if workspace.window_root_branch != branch {
+                            workspace.window_root_branch = branch;
+                            workspace.update_window_title(window, cx);
                         }
                     })
                     .is_err()
@@ -6953,32 +7012,45 @@ impl Workspace {
         let project = self.project().read(cx);
         let mut title = format!("{} ", self.window_status.emoji);
 
-        if let Some(identity_emoji) = workspace_identity_emoji(&project, cx) {
-            title.push_str(identity_emoji);
+        let branch_name = if let Some(root) = &self.window_status.root {
+            let name = root
+                .file_name()
+                .map(|name| name.to_string_lossy())
+                .unwrap_or_else(|| root.to_string_lossy());
+            title.push_str(identity_emoji(&name, root));
             title.push(' ');
-        }
-
-        for (i, worktree) in project.visible_worktrees(cx).enumerate() {
-            let worktree = worktree.read(cx);
-            let name = main_worktree_name(project, worktree, cx);
-
-            if i > 0 {
-                title.push_str(", ");
+            title.push_str(&name);
+            self.window_root_branch.clone()
+        } else {
+            if let Some(identity_emoji) = workspace_identity_emoji(&project, cx) {
+                title.push_str(identity_emoji);
+                title.push(' ');
             }
-            title.push_str(name);
-        }
 
-        if title == format!("{} ", self.window_status.emoji) {
-            title.push_str("empty project");
-        }
+            for (i, worktree) in project.visible_worktrees(cx).enumerate() {
+                let worktree = worktree.read(cx);
+                let name = main_worktree_name(project, worktree, cx);
 
-        if let Some(branch_name) = project.active_repository(cx).and_then(|repository| {
-            repository
-                .read(cx)
-                .branch
-                .as_ref()
-                .map(|branch| branch.name().to_string())
-        }) {
+                if i > 0 {
+                    title.push_str(", ");
+                }
+                title.push_str(name);
+            }
+
+            if title == format!("{} ", self.window_status.emoji) {
+                title.push_str("empty project");
+            }
+
+            project.active_repository(cx).and_then(|repository| {
+                repository
+                    .read(cx)
+                    .branch
+                    .as_ref()
+                    .map(|branch| branch.name().to_string())
+            })
+        };
+
+        if let Some(branch_name) = branch_name {
             title.push_str(" [");
             title.push_str(&branch_name);
             title.push(']');
@@ -19780,6 +19852,52 @@ mod tests {
         assert_eq!(
             *switches.borrow(),
             vec![PathBuf::from("/opened"), PathBuf::from("/root.worktrees/1")]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_window_title_names_the_status_root_and_its_branch(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/home"),
+            json!({ ".git": { "HEAD": "ref: refs/heads/develop\n" } }),
+        )
+        .await;
+        fs.insert_tree(
+            path!("/slot"),
+            json!({
+                ".zed": {
+                    "window-status.json": format!(
+                        r#"{{"state": "running", "worktree": "{}", "root": "{}"}}"#,
+                        path!("/slot"),
+                        path!("/home")
+                    )
+                }
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [path!("/slot").as_ref()], cx).await;
+        let (_workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        cx.run_until_parked();
+        let emoji = identity_emoji("home", Path::new(path!("/home")));
+        assert_eq!(
+            cx.window_title().as_deref(),
+            Some(format!("◐ {emoji} home [develop]").as_str())
+        );
+
+        fs.write(
+            Path::new(path!("/home/.git/HEAD")),
+            b"ref: refs/heads/feature\n",
+        )
+        .await
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            cx.window_title().as_deref(),
+            Some(format!("◐ {emoji} home [feature]").as_str())
         );
     }
 
