@@ -1660,6 +1660,7 @@ pub struct Workspace {
     persisted_recent_navigation_history: Vec<PathBuf>,
     last_active_project_path: Option<ProjectPath>,
     restoring_workspace: bool,
+    opening_items: bool,
 }
 
 impl EventEmitter<Event> for Workspace {}
@@ -2149,6 +2150,7 @@ impl Workspace {
             persisted_recent_navigation_history: Vec::new(),
             last_active_project_path: None,
             restoring_workspace: false,
+            opening_items: false,
         }
     }
 
@@ -2368,8 +2370,8 @@ impl Workspace {
 
             let opened_items = window
                 .update(cx, |_, window, cx| {
-                    workspace.update(cx, |_workspace: &mut Workspace, cx| {
-                        open_items(serialized_workspace, project_paths, window, cx)
+                    workspace.update(cx, |workspace: &mut Workspace, cx| {
+                        open_items(workspace, serialized_workspace, project_paths, window, cx)
                     })
                 })?
                 .await
@@ -2658,6 +2660,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        if self.opening_items || self.restoring_workspace {
+            self.pending_worktree_switch = Some(path);
+            return Task::ready(Ok(()));
+        }
         if self.active_worktree_creation.label.is_some() {
             if self.active_worktree_creation.is_switch {
                 self.pending_worktree_switch = Some(path);
@@ -2740,29 +2746,23 @@ impl Workspace {
                             serde_json::to_string(&open_files)?,
                         )
                         .await?;
-                    let close_tasks = this.update_in(cx, |workspace, window, cx| {
-                        workspace
-                            .panes()
-                            .iter()
-                            .map(|pane| {
-                                pane.update(cx, |pane, cx| {
-                                    pane.close_items(window, cx, SaveIntent::Close, &|id| {
-                                        closing_items.contains(&id)
-                                    })
-                                })
+                    let panes = this.read_with(cx, |workspace, _| workspace.panes().to_vec())?;
+                    let mut cancelled = false;
+                    for pane in panes {
+                        pane.update_in(cx, |pane, window, cx| {
+                            pane.close_items_preserving_pane(window, cx, SaveIntent::Close, &|id| {
+                                closing_items.contains(&id)
                             })
-                            .collect::<Vec<_>>()
-                    })?;
-                    for task in close_tasks {
-                        task.await?;
-                    }
-                    let cancelled = this.read_with(cx, |workspace, cx| {
-                        workspace.panes().iter().any(|pane| {
-                            pane.read(cx)
-                                .items()
+                        })?
+                        .await?;
+                        cancelled = pane.read_with(cx, |pane, _| {
+                            pane.items()
                                 .any(|item| closing_items.contains(&item.item_id()))
-                        })
-                    })?;
+                        });
+                        if cancelled {
+                            break;
+                        }
+                    }
                     if cancelled {
                         this.update(cx, |workspace, _| {
                             workspace.pending_worktree_switch = None;
@@ -2825,10 +2825,14 @@ impl Workspace {
                 Ok(())
             }
             .await;
-            this.update(cx, |workspace, cx| {
-                workspace.pending_worktree_switch = None;
+            let pending = this.update_in(cx, |workspace, window, cx| {
+                let pending = workspace.pending_worktree_switch.take();
                 workspace.set_active_worktree_creation(None, false, cx);
+                pending.map(|path| workspace.switch_worktree_in_place(path, window, cx))
             })?;
+            if let Some(pending) = pending {
+                pending.await.log_err();
+            }
             result
         })
     }
@@ -6867,12 +6871,27 @@ impl Workspace {
         }));
     }
 
-    /// Switches the window to the worktree its Herdr session selected, unless
-    /// this workspace is in the background or already shows that worktree.
-    fn follow_window_worktree(&self, window: &mut Window, cx: &mut App) {
+    fn resume_worktree_following(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.opening_items || self.restoring_workspace {
+            return;
+        }
+        if let Some(path) = self.pending_worktree_switch.take() {
+            self.switch_worktree_in_place(path, window, cx)
+                .detach_and_log_err(cx);
+        } else {
+            self.follow_window_worktree(window, cx);
+        }
+    }
+
+    /// Switches the window to the selected worktree once its initial editor items are ready.
+    fn follow_window_worktree(&mut self, window: &mut Window, cx: &mut App) {
         let Some(path) = self.window_status.worktree.clone() else {
             return;
         };
+        if self.opening_items || self.restoring_workspace {
+            self.pending_worktree_switch = Some(path);
+            return;
+        }
         if !self.owns_window_chrome()
             || (!self.active_worktree_creation.is_switch
                 && self
@@ -8033,11 +8052,13 @@ impl Workspace {
     }
 
     pub(crate) fn load_workspace(
+        &mut self,
         serialized_workspace: SerializedWorkspace,
         paths_to_open: Vec<Option<ProjectPath>>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Task<Result<Vec<Option<Box<dyn ItemHandle>>>>> {
+        self.restoring_workspace = true;
         cx.spawn_in(window, async move |workspace, cx| {
             let recent_navigation_history = serialized_workspace.recent_navigation_history.clone();
             workspace.update(cx, |workspace, _| {
@@ -8119,6 +8140,7 @@ impl Workspace {
                 }
 
                 workspace.restoring_workspace = false;
+                workspace.resume_worktree_following(window, cx);
                 cx.notify();
             })?;
 
@@ -9447,13 +9469,15 @@ fn window_bounds_env_override() -> Option<Bounds<Pixels>> {
 }
 
 fn open_items(
+    workspace: &mut Workspace,
     serialized_workspace: Option<SerializedWorkspace>,
     mut project_paths_to_open: Vec<(PathBuf, Option<ProjectPath>)>,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> impl 'static + Future<Output = Result<Vec<Option<Result<Box<dyn ItemHandle>>>>>> + use<> {
+    workspace.opening_items = true;
     let restored_items = serialized_workspace.map(|serialized_workspace| {
-        Workspace::load_workspace(
+        workspace.load_workspace(
             serialized_workspace,
             project_paths_to_open
                 .iter()
@@ -9465,6 +9489,8 @@ fn open_items(
         )
     });
 
+    let workspace = cx.weak_entity();
+    let mut async_cx = window.to_async(cx);
     cx.spawn_in(window, async move |workspace, cx| {
         let mut opened_items = Vec::with_capacity(project_paths_to_open.len());
 
@@ -9548,6 +9574,13 @@ fn open_items(
         }
 
         Ok(opened_items)
+    })
+    .then(move |result| async move {
+        workspace.update_in(&mut async_cx, |workspace, window, cx| {
+            workspace.opening_items = false;
+            workspace.resume_worktree_following(window, cx);
+        })?;
+        result
     })
 }
 
@@ -11241,8 +11274,8 @@ pub fn open_workspace_by_id(
         // Restore items from the serialized workspace
         window
             .update(cx, |_, window, cx| {
-                workspace.update(cx, |_workspace, cx| {
-                    open_items(Some(serialized_workspace), vec![], window, cx)
+                workspace.update(cx, |workspace, cx| {
+                    open_items(workspace, Some(serialized_workspace), vec![], window, cx)
                 })
             })?
             .await?;
@@ -11712,8 +11745,14 @@ async fn open_remote_project_inner(
     let items = window
         .update(cx, |_, window, cx| {
             window.activate_window();
-            workspace.update(cx, |_workspace, cx| {
-                open_items(serialized_workspace, project_paths_to_open, window, cx)
+            workspace.update(cx, |workspace, cx| {
+                open_items(
+                    workspace,
+                    serialized_workspace,
+                    project_paths_to_open,
+                    window,
+                    cx,
+                )
             })
         })?
         .await?;
@@ -18474,6 +18513,123 @@ mod tests {
         }
 
         #[gpui::test]
+        async fn test_first_worktree_follow_waits_for_initial_items(cx: &mut TestAppContext) {
+            init_test(cx);
+            cx.update(register_project_item::<TestPngItemView>);
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree(path!("/root"), json!({
+                "main": { "one.png": "", ".zed": { "window-status.json": format!(r#"{{"worktree":"{}"}}"#, path!("/root/slot")) } },
+                "slot": {}
+            })).await;
+            let project = Project::test(fs.clone(), [path!("/root/main").as_ref()], cx).await;
+            let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+                MultiWorkspace::test_new(project.clone(), window, cx)
+            });
+            let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+            workspace.update(cx, |workspace, _| workspace.opening_items = true);
+            cx.run_until_parked();
+            let old_id = project.read_with(cx, |project, cx| {
+                project.visible_worktrees(cx).next().unwrap().read(cx).id()
+            });
+            workspace.read_with(cx, |workspace, _| {
+                assert_eq!(
+                    workspace.pending_worktree_switch,
+                    Some(PathBuf::from(path!("/root/slot")))
+                );
+                assert!(workspace.active_worktree_creation.label.is_none());
+            });
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.open_path((old_id, rel_path("one.png")), None, false, window, cx)
+                })
+                .await
+                .unwrap();
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.opening_items = false;
+                workspace.resume_worktree_following(window, cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(
+                project.read_with(cx, |project, cx| project
+                    .visible_worktrees(cx)
+                    .next()
+                    .unwrap()
+                    .read(cx)
+                    .abs_path()
+                    .to_path_buf()),
+                PathBuf::from(path!("/root/slot"))
+            );
+            fs.write(
+                Path::new(path!("/root/main/.zed/window-status.json")),
+                b"{}",
+            )
+            .await
+            .unwrap();
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.switch_worktree_in_place(
+                        PathBuf::from(path!("/root/main")),
+                        window,
+                        cx,
+                    )
+                })
+                .await
+                .unwrap();
+            workspace.read_with(cx, |workspace, cx| {
+                assert_eq!(
+                    workspace.open_item_abs_paths(cx),
+                    vec![PathBuf::from(path!("/root/main/one.png"))]
+                );
+            });
+        }
+
+        #[gpui::test(iterations = 10)]
+        async fn test_switch_worktree_in_place_drains_queued_request_after_error(
+            cx: &mut TestAppContext,
+        ) {
+            init_test(cx);
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree(path!("/root"), json!({ "main": {}, "slot": {} }))
+                .await;
+            let project = Project::test(fs, [path!("/root/main").as_ref()], cx).await;
+            let (workspace, cx) =
+                cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+            let failed = workspace.update_in(cx, |workspace, window, cx| {
+                workspace.switch_worktree_in_place(
+                    PathBuf::from(path!("/root/missing")),
+                    window,
+                    cx,
+                )
+            });
+            while workspace.read_with(cx, |workspace, _| {
+                workspace.pending_worktree_switch.is_some()
+            }) {
+                assert!(cx.executor().tick());
+            }
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.switch_worktree_in_place(
+                        PathBuf::from(path!("/root/slot")),
+                        window,
+                        cx,
+                    )
+                })
+                .await
+                .unwrap();
+            assert!(failed.await.is_err());
+            assert_eq!(
+                project.read_with(cx, |project, cx| project
+                    .visible_worktrees(cx)
+                    .next()
+                    .unwrap()
+                    .read(cx)
+                    .abs_path()
+                    .to_path_buf()),
+                PathBuf::from(path!("/root/slot"))
+            );
+        }
+
+        #[gpui::test]
         async fn test_switch_worktree_in_place_keeps_other_folders(cx: &mut TestAppContext) {
             init_test(cx);
             let fs = FakeFs::new(cx.executor());
@@ -19287,6 +19443,78 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_switch_worktree_in_place_preserves_splits_and_serializes_save_prompts(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({ "main": { "one.txt": "", "two.txt": "" }, "slot": {} }),
+        )
+        .await;
+        let project = Project::test(fs, [path!("/root/main").as_ref()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let old_id = project.read_with(cx, |project, cx| {
+            project.visible_worktrees(cx).next().unwrap().read(cx).id()
+        });
+        let panes = workspace.update_in(cx, |workspace, window, cx| {
+            for (index, path) in ["one.txt", "two.txt"].into_iter().enumerate() {
+                if index > 0 {
+                    workspace.split_pane(
+                        workspace.active_pane().clone(),
+                        SplitDirection::Right,
+                        window,
+                        cx,
+                    );
+                }
+                let item = cx.new(|cx| {
+                    TestItem::new(cx).with_dirty(true).with_project_items(&[
+                        TestProjectItem::new_in_worktree(index as u64, path, old_id, cx),
+                    ])
+                });
+                workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+            }
+            let panel = cx.new(|cx| TestPanel::new_flexible(DockPosition::Right, 100, cx));
+            workspace.add_panel(panel, window, cx);
+            workspace.toggle_dock(DockPosition::Right, window, cx);
+            workspace.set_panel_size_state::<TestPanel>(
+                dock::PanelSizeState {
+                    size: None,
+                    flex: Some(0.5),
+                },
+                window,
+                cx,
+            );
+            workspace.bounds.size.width = px(1200.);
+            workspace.panes().to_vec()
+        });
+        let width = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.dock_size(&workspace.right_dock.read(cx), window, cx)
+        });
+        let switch = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.switch_worktree_in_place(PathBuf::from(path!("/root/slot")), window, cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Save");
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Save");
+        switch.await.unwrap();
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert_eq!(workspace.panes(), panes);
+            assert_eq!(workspace.center_full_height_column_count(), 2.);
+            workspace.bounds.size.width = px(1200.);
+            assert_eq!(
+                workspace.dock_size(&workspace.right_dock.read(cx), window, cx),
+                width
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn test_switch_worktree_in_place_cancels_for_dirty_files(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
@@ -19894,8 +20122,8 @@ mod tests {
             workspace.persisted_recent_navigation_history.clear();
         });
         workspace
-            .update_in(cx, |_, window, cx| {
-                Workspace::load_workspace(serialized_workspace, Vec::new(), window, cx)
+            .update_in(cx, |workspace, window, cx| {
+                workspace.load_workspace(serialized_workspace, Vec::new(), window, cx)
             })
             .await
             .unwrap();

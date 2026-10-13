@@ -1955,7 +1955,29 @@ impl Pane {
         &self,
         window: &mut Window,
         cx: &mut Context<Pane>,
+        save_intent: SaveIntent,
+        should_close: &dyn Fn(EntityId) -> bool,
+    ) -> Task<Result<()>> {
+        self.close_items_internal(window, cx, save_intent, false, should_close)
+    }
+
+    /// Closes matching items without removing the empty pane or changing its split layout.
+    pub fn close_items_preserving_pane(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Pane>,
+        save_intent: SaveIntent,
+        should_close: &dyn Fn(EntityId) -> bool,
+    ) -> Task<Result<()>> {
+        self.close_items_internal(window, cx, save_intent, true, should_close)
+    }
+
+    fn close_items_internal(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Pane>,
         mut save_intent: SaveIntent,
+        keep_pane: bool,
         should_close: &dyn Fn(EntityId) -> bool,
     ) -> Task<Result<()>> {
         // Find the items to close.
@@ -2069,7 +2091,7 @@ impl Pane {
                         pane.remove_item(
                             item_to_close.item_id(),
                             false,
-                            pane.close_pane_if_empty,
+                            !keep_pane && pane.close_pane_if_empty,
                             window,
                             cx,
                         );

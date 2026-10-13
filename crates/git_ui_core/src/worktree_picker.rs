@@ -1175,7 +1175,7 @@ impl PickerDelegate for WorktreePickerDelegate {
 
                 let is_current = self.active_worktree_paths.contains(&worktree.path);
 
-                if !is_current {
+                if !is_current || !secondary {
                     if secondary {
                         window.dispatch_action(
                             Box::new(OpenWorktreeInNewWindow {

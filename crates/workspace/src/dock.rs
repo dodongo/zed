@@ -394,6 +394,14 @@ pub struct PanelButtons {
 
 pub(crate) const PANEL_SIZE_STATE_KEY: &str = "dock_panel_size";
 
+#[derive(Default)]
+struct SharedPanelSizes {
+    sizes: collections::HashMap<String, PanelSizeState>,
+    pending_write: Option<gpui::Task<()>>,
+}
+
+impl gpui::Global for SharedPanelSizes {}
+
 fn panel_uses_flexible_width(
     position: DockPosition,
     panel: &dyn PanelHandle,
@@ -1280,14 +1288,29 @@ impl Dock {
         size_state: PanelSizeState,
         cx: &mut App,
     ) {
+        if !cx.has_global::<SharedPanelSizes>() {
+            cx.set_global(SharedPanelSizes::default());
+        }
+        let shared = cx.global_mut::<SharedPanelSizes>();
+        shared.sizes.insert(panel_key.to_owned(), size_state);
+        let previous_write = shared.pending_write.take();
         let kvp = KeyValueStore::global(cx);
         let key = panel_key.to_owned();
-        cx.background_spawn(async move {
-            kvp.scoped(PANEL_SIZE_STATE_KEY)
-                .write(key, serde_json::to_string(&size_state)?)
-                .await
-        })
-        .detach_and_log_err(cx);
+        let write = cx.background_spawn(async move {
+            if let Some(previous_write) = previous_write {
+                previous_write.await;
+            }
+            match serde_json::to_string(&size_state) {
+                Ok(json) => {
+                    kvp.scoped(PANEL_SIZE_STATE_KEY)
+                        .write(key, json)
+                        .await
+                        .log_err();
+                }
+                Err(error) => log::error!("Failed to serialize shared panel size: {error}"),
+            }
+        });
+        cx.global_mut::<SharedPanelSizes>().pending_write = Some(write);
 
         let panel_key = panel_key.to_owned();
         cx.defer(move |cx| {
@@ -1318,6 +1341,12 @@ impl Dock {
         panel_key: &'static str,
         cx: &App,
     ) -> Option<PanelSizeState> {
+        if let Some(size) = cx
+            .try_global::<SharedPanelSizes>()
+            .and_then(|shared| shared.sizes.get(panel_key))
+        {
+            return Some(*size);
+        }
         let kvp = KeyValueStore::global(cx);
         let scope = kvp.scoped(PANEL_SIZE_STATE_KEY);
         scope
@@ -1946,6 +1975,48 @@ mod tests {
                 assert_eq!(dock.active_panel_index(), Some(0));
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    async fn shared_panel_sizes_are_immediate_and_writes_stay_ordered(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
+            cx.set_global(db::AppDatabase::test_new());
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let workspace = cx.add_window(|window, cx| Workspace::test_new(project, window, cx));
+        let size = PanelSizeState {
+            size: Some(px(543.)),
+            flex: Some(0.45),
+        };
+        workspace
+            .update(cx, |workspace, window, cx| {
+                Dock::persist_shared_panel_size_state(
+                    TestPanel::panel_key(),
+                    PanelSizeState::default(),
+                    cx,
+                );
+                Dock::persist_shared_panel_size_state(TestPanel::panel_key(), size, cx);
+                assert_eq!(
+                    Dock::load_persisted_size_state(workspace, TestPanel::panel_key(), cx),
+                    Some(size)
+                );
+                let panel = cx.new(|cx| TestPanel::new(DockPosition::Right, 100, cx));
+                workspace.add_panel(panel, window, cx);
+                assert_eq!(workspace.panel_size_state::<TestPanel>(cx), Some(size));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let kvp = cx.read(KeyValueStore::global);
+        assert_eq!(
+            kvp.scoped(PANEL_SIZE_STATE_KEY)
+                .read(TestPanel::panel_key())
+                .unwrap(),
+            Some(serde_json::to_string(&size).unwrap())
+        );
     }
 
     #[gpui::test]
