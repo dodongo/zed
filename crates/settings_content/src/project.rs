@@ -623,6 +623,16 @@ pub struct GitSettings {
     ///
     /// Default: null
     pub worktree_list_command: Option<Vec<String>>,
+    /// A command run in the background when an existing worktree is selected
+    /// in the picker, including the current worktree. The first element is
+    /// the program (a leading `~/` expands to the home directory) and the rest
+    /// are arguments; the selected worktree's absolute path is appended,
+    /// followed by the window's folder paths. Opening in a new window and
+    /// automatic worktree following do not run this command. Failures are
+    /// logged without preventing the switch.
+    ///
+    /// Default: null
+    pub worktree_select_command: Option<Vec<String>>,
 }
 
 #[with_fallible_options]

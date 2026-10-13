@@ -338,6 +338,15 @@ async fn run_worktree_list_command(
     command: &[String],
     window_folders: &[PathBuf],
 ) -> anyhow::Result<Vec<ListedWorktree>> {
+    let stdout = run_worktree_command(command, None, window_folders).await?;
+    serde_json::from_slice(&stdout).with_context(|| format!("{} printed invalid JSON", command[0]))
+}
+
+async fn run_worktree_command(
+    command: &[String],
+    selected_path: Option<&Path>,
+    window_folders: &[PathBuf],
+) -> anyhow::Result<Vec<u8>> {
     let (program, arguments) = command.split_first().context("the command is empty")?;
     let program = match program.strip_prefix("~/") {
         Some(relative) => util::paths::home_dir().join(relative),
@@ -345,6 +354,7 @@ async fn run_worktree_list_command(
     };
     let output = util::command::new_command(&program)
         .args(arguments)
+        .args(selected_path)
         .args(window_folders)
         .output()
         .await
@@ -356,8 +366,7 @@ async fn run_worktree_list_command(
         output.status,
         String::from_utf8_lossy(&output.stderr).trim()
     );
-    serde_json::from_slice(&output.stdout)
-        .with_context(|| format!("{} printed invalid JSON", program.display()))
+    Ok(output.stdout)
 }
 
 #[derive(Clone)]
@@ -1131,6 +1140,37 @@ impl PickerDelegate for WorktreePickerDelegate {
             WorktreeEntry::Worktree { worktree, .. } => {
                 if self.deleting_worktree_paths.contains(&worktree.path) {
                     return;
+                }
+
+                if !secondary
+                    && let Some(command) = ProjectSettings::get_global(cx)
+                        .git
+                        .worktree_select_command
+                        .clone()
+                {
+                    let selected_path = worktree.path.clone();
+                    let mut window_folders: Vec<_> = self
+                        .project
+                        .read(cx)
+                        .visible_worktrees(cx)
+                        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                        .collect();
+                    window_folders.sort();
+                    cx.background_executor()
+                        .spawn(async move {
+                            if let Err(error) = run_worktree_command(
+                                &command,
+                                Some(&selected_path),
+                                &window_folders,
+                            )
+                            .await
+                            {
+                                log::error!(
+                                    "WorktreePicker: worktree select command failed: {error:#}"
+                                );
+                            }
+                        })
+                        .detach();
                 }
 
                 let is_current = self.active_worktree_paths.contains(&worktree.path);
@@ -2320,6 +2360,52 @@ mod tests {
         let error =
             futures::executor::block_on(run_worktree_list_command(&failing, &[])).unwrap_err();
         assert!(format!("{error:#}").contains("broken"), "{error:#}");
+    }
+
+    #[test]
+    fn test_worktree_select_command_receives_selected_path_before_window_folders() {
+        let command = [
+            "/bin/sh",
+            "-c",
+            r#"printf '%s\n' "$@""#,
+            "sh",
+            "configured argument",
+        ]
+        .map(String::from);
+        let output = futures::executor::block_on(run_worktree_command(
+            &command,
+            Some(Path::new("/selected worktree")),
+            &["/window folder one".into(), "/window-folder-two".into()],
+        ))
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "configured argument\n/selected worktree\n/window folder one\n/window-folder-two\n"
+        );
+    }
+
+    #[test]
+    fn test_worktree_select_command_reports_failures_and_expands_tilde() {
+        let selected_path = Some(Path::new("/selected"));
+        let failing = ["/bin/sh", "-c", "echo selection-broken >&2; exit 3"].map(String::from);
+        let error = futures::executor::block_on(run_worktree_command(&failing, selected_path, &[]))
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("selection-broken"), "{message}");
+        assert!(message.contains("3"), "{message}");
+
+        let missing = ["~/zed-worktree-select-command-does-not-exist".to_string()];
+        let error = futures::executor::block_on(run_worktree_command(&missing, selected_path, &[]))
+            .unwrap_err();
+        let expanded = util::paths::home_dir().join("zed-worktree-select-command-does-not-exist");
+        assert!(
+            format!("{error:#}").contains(&format!("failed to run {}", expanded.display())),
+            "{error:#}"
+        );
+
+        let error =
+            futures::executor::block_on(run_worktree_command(&[], selected_path, &[])).unwrap_err();
+        assert_eq!(error.to_string(), "the command is empty");
     }
 
     #[gpui::test]

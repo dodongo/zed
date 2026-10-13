@@ -1805,6 +1805,13 @@
     //
     // Trailing slashes are ignored.
     "worktree_directory": "../worktrees",
+    // Command run in the background for manual selections of existing worktrees
+    // in the picker, including the current worktree. The first element is the
+    // program (a leading ~/ expands to the home directory), followed by arguments.
+    // The selected absolute path and then the window's folder paths are appended.
+    // Not run for opening in a new window or automatic worktree following.
+    // Failures are logged without preventing the switch.
+    "worktree_select_command": null,
   },
   // The list of custom Git hosting providers.
   "git_hosting_providers": [
