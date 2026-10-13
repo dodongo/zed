@@ -135,6 +135,11 @@ pub struct WorkspaceSettingsContent {
     ///
     /// Default: true
     pub zoomed_padding: Option<bool>,
+    /// Whether the right dock sits just right of the left dock, before the editor, instead of at
+    /// the window's right edge.
+    ///
+    /// Default: false
+    pub right_dock_beside_left_dock: Option<bool>,
     /// Whether invoking a panel's `ToggleFocus` action while the panel is
     /// already focused closes the panel, instead of just moving focus back
     /// to the editor. This only applies to a panel's focus-toggle action, not

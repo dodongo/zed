@@ -1622,6 +1622,7 @@ pub struct Workspace {
     _schedule_serialize_ssh_paths: Option<Task<()>>,
     pane_history_timestamp: Arc<AtomicUsize>,
     bounds: Bounds<Pixels>,
+    right_dock_left_edge: Pixels,
     pub centered_layout: bool,
     bounds_save_task_queued: Option<Task<()>>,
     on_prompt_for_new_path: Option<PromptForNewPath>,
@@ -2115,6 +2116,7 @@ impl Workspace {
             workspace_actions: Default::default(),
             // This data will be incorrect, but it will be overwritten by the time it needs to be used.
             bounds: Default::default(),
+            right_dock_left_edge: Pixels::ZERO,
             centered_layout: false,
             bounds_save_task_queued: None,
             on_prompt_for_new_path: None,
@@ -8637,6 +8639,41 @@ impl Workspace {
             )
     }
 
+    /// Renders the right dock when its `right_dock_beside_left_dock` setting matches
+    /// `beside_left_dock`, so each layout places it in one of its two spots.
+    fn render_right_dock(
+        &self,
+        beside_left_dock: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Stateful<Div>> {
+        if WorkspaceSettings::get_global(cx).right_dock_beside_left_dock != beside_left_dock {
+            return None;
+        }
+        let dock = self.render_dock(DockPosition::Right, &self.right_dock, window, cx)?;
+        if !beside_left_dock {
+            return Some(dock);
+        }
+        // Dragging the resize handle on this dock's right edge sizes it from its left edge.
+        let workspace = self.weak_self.clone();
+        Some(
+            dock.child(
+                canvas(
+                    move |bounds, _, cx| {
+                        workspace
+                            .update(cx, |workspace, _| {
+                                workspace.right_dock_left_edge = bounds.left();
+                            })
+                            .ok();
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            ),
+        )
+    }
+
     fn render_dock(
         &self,
         position: DockPosition,
@@ -9715,6 +9752,27 @@ impl Render for Workspace {
                                                         cx,
                                                     );
                                                 }
+                                                DockPosition::Right
+                                                    if WorkspaceSettings::get_global(cx)
+                                                        .right_dock_beside_left_dock =>
+                                                {
+                                                    // The left dock keeps its width, so the
+                                                    // right dock's left edge stays put and its
+                                                    // right edge follows the pointer.
+                                                    let left_edge = workspace.right_dock_left_edge;
+                                                    workspace.resize_right_dock(
+                                                        e.event.position.x - left_edge,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                    if workspace.left_dock.read(cx).is_open() {
+                                                        workspace.resize_left_dock(
+                                                            left_edge - workspace.bounds.left(),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    }
+                                                }
                                                 DockPosition::Right => {
                                                     workspace.resize_right_dock(
                                                         workspace.bounds.right()
@@ -9755,6 +9813,7 @@ impl Render for Workspace {
                                                     window,
                                                     cx,
                                                 ))
+                                                .children(self.render_right_dock(true, window, cx))
                                                 .child(
                                                     div()
                                                         .flex()
@@ -9780,12 +9839,9 @@ impl Render for Workspace {
                                                                 ),
                                                         ),
                                                 )
-                                                .children(self.render_dock(
-                                                    DockPosition::Right,
-                                                    &self.right_dock,
-                                                    window,
-                                                    cx,
-                                                )),
+                                                .children(
+                                                    self.render_right_dock(false, window, cx),
+                                                ),
                                         )
                                         .child(div().w_full().children(self.render_dock(
                                             DockPosition::Bottom,
@@ -9815,6 +9871,11 @@ impl Render for Workspace {
                                                             window,
                                                             cx,
                                                         ))
+                                                        .children(
+                                                            self.render_right_dock(
+                                                                true, window, cx,
+                                                            ),
+                                                        )
                                                         .child(
                                                             div()
                                                                 .flex()
@@ -9855,12 +9916,7 @@ impl Render for Workspace {
                                                     cx,
                                                 ))),
                                         )
-                                        .children(self.render_dock(
-                                            DockPosition::Right,
-                                            &self.right_dock,
-                                            window,
-                                            cx,
-                                        )),
+                                        .children(self.render_right_dock(false, window, cx)),
                                     BottomDockLayout::RightAligned => div()
                                         .flex()
                                         .flex_row()
@@ -9871,6 +9927,7 @@ impl Render for Workspace {
                                             window,
                                             cx,
                                         ))
+                                        .children(self.render_right_dock(true, window, cx))
                                         .child(
                                             div()
                                                 .flex()
@@ -9914,12 +9971,11 @@ impl Render for Workspace {
                                                                         ),
                                                                 ),
                                                         )
-                                                        .children(self.render_dock(
-                                                            DockPosition::Right,
-                                                            &self.right_dock,
-                                                            window,
-                                                            cx,
-                                                        )),
+                                                        .children(
+                                                            self.render_right_dock(
+                                                                false, window, cx,
+                                                            ),
+                                                        ),
                                                 )
                                                 .child(div().w_full().children(self.render_dock(
                                                     DockPosition::Bottom,
@@ -9938,6 +9994,7 @@ impl Render for Workspace {
                                             window,
                                             cx,
                                         ))
+                                        .children(self.render_right_dock(true, window, cx))
                                         .child(
                                             div()
                                                 .flex()
@@ -9966,12 +10023,7 @@ impl Render for Workspace {
                                                     cx,
                                                 )),
                                         )
-                                        .children(self.render_dock(
-                                            DockPosition::Right,
-                                            &self.right_dock,
-                                            window,
-                                            cx,
-                                        )),
+                                        .children(self.render_right_dock(false, window, cx)),
                                 }
                             })
                             .children(self.zoomed.as_ref().and_then(|view| {

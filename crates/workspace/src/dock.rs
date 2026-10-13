@@ -1299,6 +1299,7 @@ impl Render for Dock {
         let dispatch_context = Self::dispatch_context();
         if let Some(entry) = self.visible_entry() {
             let position = self.position;
+            let beside_left_dock = WorkspaceSettings::get_global(cx).right_dock_beside_left_dock;
             let create_resize_handle = || {
                 let handle = div()
                     .id("resize-handle")
@@ -1346,6 +1347,15 @@ impl Render for Dock {
                             .h(RESIZE_HANDLE_SIZE)
                             .cursor_row_resize(),
                     ),
+                    DockPosition::Right if beside_left_dock => deferred(
+                        handle
+                            .absolute()
+                            .top(px(0.))
+                            .right(-RESIZE_HANDLE_SIZE / 2.)
+                            .h_full()
+                            .w(RESIZE_HANDLE_SIZE)
+                            .cursor_col_resize(),
+                    ),
                     DockPosition::Right => deferred(
                         handle
                             .absolute()
@@ -1375,6 +1385,7 @@ impl Render for Dock {
                 })
                 .map(|this| match self.position() {
                     DockPosition::Left => this.border_r_1(),
+                    DockPosition::Right if beside_left_dock => this.border_r_1(),
                     DockPosition::Right => this.border_l_1(),
                     DockPosition::Bottom => this.border_t_1(),
                 })

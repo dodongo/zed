@@ -232,6 +232,11 @@
   //
   // Default: true
   "zoomed_padding": true,
+  // Whether the right dock sits just right of the left dock, before the editor,
+  // instead of at the window's right edge.
+  //
+  // Default: false
+  "right_dock_beside_left_dock": false,
   // On Linux, what draws Zed's window decorations (titlebar).
   // This setting has no effect on other platforms:
   // 1. Zed draws its own window decorations.

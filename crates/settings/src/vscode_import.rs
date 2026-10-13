@@ -1089,6 +1089,7 @@ impl VsCodeSettings {
                 }
             }),
             zoomed_padding: None,
+            right_dock_beside_left_dock: None,
             focus_follows_mouse: None,
         }
     }
