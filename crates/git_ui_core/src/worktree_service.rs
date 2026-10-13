@@ -120,14 +120,6 @@ pub fn worktree_create_targets(
     targets
 }
 
-/// Whether a worktree operation is creating a new one or switching to an
-/// existing one. Controls whether the source workspace's state (dock layout,
-/// open files, agent panel draft) is inherited by the destination.
-enum WorktreeOperation {
-    Create,
-    Switch,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RemoteBranchFetchMode {
     Fetch,
@@ -898,68 +890,22 @@ pub fn handle_switch_worktree(
     workspace: &mut Workspace,
     action: &zed_actions::SwitchWorktree,
     window: &mut gpui::Window,
-    fallback_focused_dock: Option<DockPosition>,
+    _fallback_focused_dock: Option<DockPosition>,
     cx: &mut gpui::Context<Workspace>,
 ) {
-    let project = workspace.project().clone();
-
-    if project.read(cx).repositories(cx).is_empty() {
-        log::error!("switch_to_worktree: no git repository in the project");
-        return;
-    }
-    if project.read(cx).is_via_collab() {
+    if workspace.project().read(cx).is_via_collab() {
         log::error!("switch_to_worktree: not supported in collab projects");
         return;
     }
 
-    // Guard against concurrent creation
-    if workspace.active_worktree_creation().label.is_some() {
-        return;
-    }
-
-    let previous_state =
-        workspace.capture_state_for_worktree_switch(window, fallback_focused_dock, cx);
-    let workspace_handle = workspace.weak_handle();
-    let window_handle = window.window_handle().downcast::<MultiWorkspace>();
-    let remote_connection_options = project.read(cx).remote_connection_options(cx);
-
-    let (git_repos, non_git_paths) = classify_worktrees(project.read(cx), cx);
-
-    let git_repo_work_dirs: Vec<PathBuf> = git_repos
-        .iter()
-        .map(|repo| repo.read(cx).work_directory_abs_path.to_path_buf())
-        .collect();
-
-    let display_name: SharedString = action.display_name.clone().into();
-
-    workspace.set_active_worktree_creation(Some(display_name), true, cx);
-
-    let worktree_path = action.path.clone();
-
-    cx.spawn_in(window, async move |_workspace_entity, mut cx| {
-        let result = do_switch_worktree(
-            worktree_path,
-            git_repo_work_dirs,
-            non_git_paths,
-            previous_state,
-            workspace_handle.clone(),
-            window_handle,
-            remote_connection_options,
-            &mut cx,
-        )
-        .await;
-
-        if let Err(err) = &result {
-            log::error!("Failed to switch worktree: {err}");
-            workspace_handle
-                .update(cx, |workspace, cx| {
-                    workspace.set_active_worktree_creation(None, false, cx);
-                    show_error_toast(cx.entity(), "worktree switch", anyhow!("{err:#}"), cx);
-                })
-                .ok();
+    let switch = workspace.switch_worktree_in_place(action.path.clone(), window, cx);
+    cx.spawn(async move |workspace, cx| {
+        if let Err(error) = switch.await {
+            workspace.update(cx, |_, cx| {
+                show_error_toast(cx.entity(), "worktree switch", error, cx);
+            })?;
         }
-
-        result
+        anyhow::Ok(())
     })
     .detach_and_log_err(cx);
 }
@@ -1096,7 +1042,6 @@ async fn do_create_worktree(
         workspace,
         window_handle,
         remote_connection_options,
-        WorktreeOperation::Create,
         activate,
         cx,
     )
@@ -1106,42 +1051,6 @@ async fn do_create_worktree(
         workspace,
         consolidated_worktrees,
     })
-}
-
-async fn do_switch_worktree(
-    worktree_path: PathBuf,
-    git_repo_work_dirs: Vec<PathBuf>,
-    non_git_paths: Vec<PathBuf>,
-    previous_state: PreviousWorkspaceState,
-    workspace: WeakEntity<Workspace>,
-    window_handle: Option<gpui::WindowHandle<MultiWorkspace>>,
-    remote_connection_options: Option<RemoteConnectionOptions>,
-    cx: &mut AsyncWindowContext,
-) -> anyhow::Result<Entity<Workspace>> {
-    let path_remapping: Vec<(PathBuf, PathBuf)> = git_repo_work_dirs
-        .iter()
-        .map(|work_dir| (work_dir.clone(), worktree_path.clone()))
-        .collect();
-
-    let mut all_paths = vec![worktree_path];
-    let has_non_git = !non_git_paths.is_empty();
-    all_paths.extend(non_git_paths.iter().cloned());
-
-    open_worktree_workspace(
-        all_paths,
-        path_remapping,
-        non_git_paths,
-        has_non_git,
-        previous_state,
-        workspace,
-        window_handle,
-        remote_connection_options,
-        WorktreeOperation::Switch,
-        // Switching is always an explicit, foreground user action.
-        true,
-        cx,
-    )
-    .await
 }
 
 /// Core workspace opening logic shared by both create and switch flows.
@@ -1156,7 +1065,6 @@ async fn open_worktree_workspace(
     workspace: WeakEntity<Workspace>,
     window_handle: Option<gpui::WindowHandle<MultiWorkspace>>,
     remote_connection_options: Option<RemoteConnectionOptions>,
-    operation: WorktreeOperation,
     activate: bool,
     cx: &mut AsyncWindowContext,
 ) -> anyhow::Result<Entity<Workspace>> {
@@ -1165,14 +1073,12 @@ async fn open_worktree_workspace(
 
     let focused_dock = previous_state.focused_dock;
 
-    let is_creating_new_worktree = matches!(operation, WorktreeOperation::Create);
-
     // When `activate` is false the new workspace is opened in the background
     // (e.g. the agent's `create_thread` tool), so it should be a clean
     // checkout rather than inheriting the source workspace's open files and
     // dock layout. The state transfer only applies when we're foregrounding
     // a freshly-created worktree for the user.
-    let transfer_state = is_creating_new_worktree && activate;
+    let transfer_state = activate;
 
     let source_for_transfer = if transfer_state {
         Some(workspace.clone())
@@ -1385,20 +1291,16 @@ async fn open_worktree_workspace(
             multi_workspace.add(new_workspace.clone(), window, cx);
         }
 
-        if is_creating_new_worktree {
-            new_workspace.update(cx, |workspace, cx| {
-                // Run create-worktree setup hooks regardless of foreground vs
-                // background — the worktree was created either way.
-                workspace.run_create_worktree_tasks(window, cx);
+        new_workspace.update(cx, |workspace, cx| {
+            workspace.run_create_worktree_tasks(window, cx);
 
-                if activate && let Some(dock_position) = focused_dock {
-                    let dock = workspace.dock_at_position(dock_position);
-                    if let Some(panel) = dock.read(cx).active_panel() {
-                        panel.activation_focus_handle(cx).focus(window, cx);
-                    }
+            if activate && let Some(dock_position) = focused_dock {
+                let dock = workspace.dock_at_position(dock_position);
+                if let Some(panel) = dock.read(cx).active_panel() {
+                    panel.activation_focus_handle(cx).focus(window, cx);
                 }
-            });
-        }
+            }
+        });
     })?;
 
     Ok(new_workspace)

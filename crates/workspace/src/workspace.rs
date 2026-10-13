@@ -152,7 +152,7 @@ use url::Url;
 use util::{
     ResultExt, TryFutureExt,
     paths::{PathStyle, SanitizedPath},
-    rel_path::RelPath,
+    rel_path::{RelPath, RelPathBuf},
     serde::default_true,
 };
 use uuid::Uuid;
@@ -175,6 +175,13 @@ use crate::{
 pub const SERIALIZATION_THROTTLE_TIME: Duration = Duration::from_millis(200);
 pub const MAX_RECENT_SELECTIONS: usize = 20;
 const WINDOW_STATUS_PATH: &str = ".zed/window-status.json";
+const WORKTREE_OPEN_FILES_STATE_KEY: &str = "worktree_open_files";
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct WorktreeOpenFiles {
+    paths: Vec<RelPathBuf>,
+    active: Option<RelPathBuf>,
+}
 const IDENTITY_EMOJI_FAMILIES: &[&[&str]] = &[
     &["🟦", "🟪", "🟧", "🟫", "⬛"],
     &["🔷", "🔶", "🔹", "🔸", "💠"],
@@ -1615,6 +1622,7 @@ pub struct Workspace {
     _subscriptions: Vec<Subscription>,
     window_status: WindowStatus,
     _window_status_watcher: Option<Task<()>>,
+    pending_worktree_switch: Option<PathBuf>,
     _apply_leader_updates: Task<Result<()>>,
     _observe_current_user: Task<Result<()>>,
     _schedule_serialize_workspace: Option<Task<()>>,
@@ -2107,6 +2115,7 @@ impl Workspace {
             _apply_leader_updates,
             window_status: WindowStatus::default(),
             _window_status_watcher: None,
+            pending_worktree_switch: None,
             _schedule_serialize_workspace: None,
             _serialize_workspace_task: None,
             _schedule_serialize_ssh_paths: None,
@@ -2638,6 +2647,176 @@ impl Workspace {
             active_file_path,
             focused_dock,
         }
+    }
+
+    /// Replaces the primary project folder without replacing this workspace or its panels.
+    /// Open files are remembered per root; cancelling a dirty-file prompt cancels the switch.
+    /// Concurrent requests are coalesced to the most recently requested folder.
+    pub fn switch_worktree_in_place(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        if self.active_worktree_creation.label.is_some() {
+            if self.active_worktree_creation.is_switch {
+                self.pending_worktree_switch = Some(path);
+            }
+            return Task::ready(Ok(()));
+        }
+        self.pending_worktree_switch = Some(path);
+        self.set_active_worktree_creation(Some("Switching worktree".into()), true, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let result: Result<()> = async {
+                while let Some(path) =
+                    this.update(cx, |workspace, _| workspace.pending_worktree_switch.take())?
+                {
+                    let project = this.read_with(cx, |workspace, _| workspace.project.clone())?;
+                    let old_root = project
+                        .read_with(cx, |project, cx| project.visible_worktrees(cx).next())?;
+                    let Some(old_root) = old_root else {
+                        return Err(anyhow!(
+                            "Cannot switch a workspace without a project folder"
+                        ));
+                    };
+                    let (old_id, old_path) =
+                        old_root.read_with(cx, |root, _| (root.id(), root.abs_path()))?;
+                    if old_path.as_ref() == path {
+                        continue;
+                    }
+
+                    let destination = project
+                        .update(cx, |project, cx| {
+                            project.resolve_abs_path(&path.to_string_lossy(), cx)
+                        })
+                        .await;
+                    if !matches!(
+                        destination,
+                        Some(ResolvedPath::AbsPath { is_dir: true, .. })
+                    ) {
+                        return Err(anyhow!(
+                            "Worktree folder does not exist: {}",
+                            path.display()
+                        ));
+                    }
+                    let kvp = cx.update(|_, cx| db::kvp::KeyValueStore::global(cx))?;
+                    let saved: WorktreeOpenFiles = kvp
+                        .scoped(WORKTREE_OPEN_FILES_STATE_KEY)
+                        .read(&path.to_string_lossy())?
+                        .map(|json| serde_json::from_str(&json))
+                        .transpose()?
+                        .unwrap_or_default();
+                    let (open_files, closing_items) = this.read_with(cx, |workspace, cx| {
+                        let active = workspace
+                            .last_active_center_pane
+                            .as_ref()
+                            .and_then(|pane| pane.upgrade())
+                            .and_then(|pane| pane.read(cx).active_item())
+                            .and_then(|item| item.project_path(cx))
+                            .filter(|path| path.worktree_id == old_id)
+                            .map(|path| path.path.as_ref().to_owned());
+                        let mut paths = Vec::new();
+                        let mut closing_items = HashSet::default();
+                        for pane in workspace.panes() {
+                            for item in pane.read(cx).items() {
+                                if let Some(path) = item.project_path(cx)
+                                    && path.worktree_id == old_id
+                                {
+                                    if !paths.iter().any(|saved: &RelPathBuf| {
+                                        saved.as_ref() == path.path.as_ref()
+                                    }) {
+                                        paths.push(path.path.as_ref().to_owned());
+                                    }
+                                    closing_items.insert(item.item_id());
+                                }
+                            }
+                        }
+                        (WorktreeOpenFiles { paths, active }, closing_items)
+                    })?;
+                    kvp.scoped(WORKTREE_OPEN_FILES_STATE_KEY)
+                        .write(
+                            old_path.to_string_lossy().into_owned(),
+                            serde_json::to_string(&open_files)?,
+                        )
+                        .await?;
+                    let close_tasks = this.update_in(cx, |workspace, window, cx| {
+                        workspace
+                            .panes()
+                            .iter()
+                            .map(|pane| {
+                                pane.update(cx, |pane, cx| {
+                                    pane.close_items(window, cx, SaveIntent::Close, &|id| {
+                                        closing_items.contains(&id)
+                                    })
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    })?;
+                    for task in close_tasks {
+                        task.await?;
+                    }
+                    let cancelled = this.read_with(cx, |workspace, cx| {
+                        workspace.panes().iter().any(|pane| {
+                            pane.read(cx)
+                                .items()
+                                .any(|item| closing_items.contains(&item.item_id()))
+                        })
+                    })?;
+                    if cancelled {
+                        this.update(cx, |workspace, _| {
+                            workspace.pending_worktree_switch = None;
+                        })?;
+                        break;
+                    }
+                    let new_root = project
+                        .update(cx, |project, cx| project.create_worktree(&path, true, cx))
+                        .await?;
+                    let new_id = new_root.read_with(cx, |root, _| root.id())?;
+                    project.update(cx, |project, cx| project.remove_worktree(old_id, cx));
+                    for path in saved.paths {
+                        let project_path = ProjectPath {
+                            worktree_id: new_id,
+                            path: path.into(),
+                        };
+                        this.update_in(cx, |workspace, window, cx| {
+                            workspace.open_path(project_path, None, false, window, cx)
+                        })?
+                        .await
+                        .log_err();
+                    }
+                    this.update_in(cx, |workspace, window, cx| {
+                        if let Some(active) = saved.active {
+                            let active = ProjectPath {
+                                worktree_id: new_id,
+                                path: active.into(),
+                            };
+                            for pane in workspace.panes() {
+                                let index = pane.read(cx).items().position(|item| {
+                                    item.project_path(cx).as_ref() == Some(&active)
+                                });
+                                if let Some(index) = index {
+                                    pane.update(cx, |pane, cx| {
+                                        pane.activate_item(index, false, false, window, cx)
+                                    });
+                                    break;
+                                }
+                            }
+                        }
+                        workspace.start_window_status_watcher(window, cx);
+                        workspace.update_window_title(window, cx);
+                        workspace.serialize_workspace(window, cx);
+                        cx.notify();
+                    })?;
+                }
+                Ok(())
+            }
+            .await;
+            this.update(cx, |workspace, cx| {
+                workspace.pending_worktree_switch = None;
+                workspace.set_active_worktree_creation(None, false, cx);
+            })?;
+            result
+        })
     }
 
     pub fn open_item_abs_paths(&self, cx: &App) -> Vec<PathBuf> {
@@ -6671,12 +6850,8 @@ impl Workspace {
 
         self._window_status_watcher = Some(cx.spawn_in(window, async move |this, cx| {
             let _watcher = watcher;
-            // The first read only records the selected worktree, so opening a
-            // workspace never switches away from it.
-            let mut follow_worktree = false;
             while let Some(contents) = status_rx.next().await {
                 let status = parse_window_status(&contents);
-                let follow = std::mem::replace(&mut follow_worktree, true);
                 if this
                     .update_in(cx, |workspace, window, cx| {
                         if workspace.window_status == status {
@@ -6685,7 +6860,7 @@ impl Workspace {
                         let worktree_changed = workspace.window_status.worktree != status.worktree;
                         workspace.window_status = status;
                         workspace.update_window_title(window, cx);
-                        if follow && worktree_changed {
+                        if worktree_changed {
                             workspace.follow_window_worktree(window, cx);
                         }
                     })
@@ -18136,6 +18311,228 @@ mod tests {
         }
 
         #[gpui::test]
+        async fn test_switch_worktree_in_place_remembers_files_and_preserves_panels(
+            cx: &mut TestAppContext,
+        ) {
+            init_test(cx);
+            cx.update(register_project_item::<TestPngItemView>);
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree(
+                path!("/root"),
+                json!({
+                    "main": { "one.png": "", "two.png": "" },
+                    "slot": { "slot.png": "" }
+                }),
+            )
+            .await;
+            let project = Project::test(fs.clone(), [path!("/root/main").as_ref()], cx).await;
+            let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+                MultiWorkspace::test_new(project.clone(), window, cx)
+            });
+            let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+            let old_id = project.read_with(cx, |project, cx| {
+                project.visible_worktrees(cx).next().unwrap().read(cx).id()
+            });
+            for path in ["one.png", "two.png"] {
+                workspace
+                    .update_in(cx, |workspace, window, cx| {
+                        workspace.open_path((old_id, rel_path(path)), None, true, window, cx)
+                    })
+                    .await
+                    .unwrap();
+            }
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace
+                    .active_pane()
+                    .update(cx, |pane, cx| pane.activate_item(0, true, true, window, cx));
+            });
+            let panel = workspace.update_in(cx, |workspace, window, cx| {
+                let panel = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+                workspace.add_panel(panel.clone(), window, cx);
+                workspace.toggle_dock(DockPosition::Left, window, cx);
+                panel
+            });
+            let size = dock::PanelSizeState {
+                size: Some(px(431.)),
+                flex: None,
+            };
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.set_panel_size_state::<TestPanel>(size, window, cx);
+            });
+            let docks = workspace.read_with(cx, |workspace, _| {
+                [
+                    workspace.left_dock.clone(),
+                    workspace.bottom_dock.clone(),
+                    workspace.right_dock.clone(),
+                ]
+            });
+
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.switch_worktree_in_place(
+                        PathBuf::from(path!("/root/slot")),
+                        window,
+                        cx,
+                    )
+                })
+                .await
+                .unwrap();
+            cx.run_until_parked();
+            assert_eq!(
+                multi_workspace.read_with(cx, |mw, _| mw.workspace().clone()),
+                workspace
+            );
+            workspace.read_with(cx, |workspace, cx| {
+                assert_eq!(
+                    [
+                        workspace.left_dock.clone(),
+                        workspace.bottom_dock.clone(),
+                        workspace.right_dock.clone()
+                    ],
+                    docks
+                );
+                assert_eq!(workspace.panel::<TestPanel>(cx), Some(panel.clone()));
+                assert_eq!(workspace.panel_size_state::<TestPanel>(cx), Some(size));
+                assert!(workspace.left_dock.read(cx).is_open());
+                assert!(workspace.open_item_abs_paths(cx).is_empty());
+            });
+            let slot_id = project.read_with(cx, |project, cx| {
+                project.visible_worktrees(cx).next().unwrap().read(cx).id()
+            });
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.open_path((slot_id, rel_path("slot.png")), None, true, window, cx)
+                })
+                .await
+                .unwrap();
+
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.switch_worktree_in_place(
+                        PathBuf::from(path!("/root/main")),
+                        window,
+                        cx,
+                    )
+                })
+                .await
+                .unwrap();
+            cx.run_until_parked();
+            workspace.read_with(cx, |workspace, cx| {
+                assert_eq!(
+                    workspace.open_item_abs_paths(cx),
+                    vec![
+                        PathBuf::from(path!("/root/main/one.png")),
+                        PathBuf::from(path!("/root/main/two.png"))
+                    ]
+                );
+                assert_eq!(
+                    workspace
+                        .active_pane()
+                        .read(cx)
+                        .active_item()
+                        .unwrap()
+                        .project_path(cx)
+                        .unwrap()
+                        .path,
+                    rel_path("one.png")
+                );
+                assert_eq!(workspace.panel::<TestPanel>(cx), Some(panel.clone()));
+                let kvp = db::kvp::KeyValueStore::global(cx);
+                let saved: WorktreeOpenFiles = serde_json::from_str(
+                    &kvp.scoped(WORKTREE_OPEN_FILES_STATE_KEY)
+                        .read(path!("/root/main"))
+                        .unwrap()
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    saved.paths,
+                    vec![
+                        rel_path("one.png").as_ref().to_owned(),
+                        rel_path("two.png").as_ref().to_owned()
+                    ]
+                );
+            });
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.switch_worktree_in_place(
+                        PathBuf::from(path!("/root/slot")),
+                        window,
+                        cx,
+                    )
+                })
+                .await
+                .unwrap();
+            workspace.read_with(cx, |workspace, cx| {
+                assert_eq!(
+                    workspace.open_item_abs_paths(cx),
+                    vec![PathBuf::from(path!("/root/slot/slot.png"))]
+                );
+            });
+        }
+
+        #[gpui::test]
+        async fn test_switch_worktree_in_place_coalesces_requests_and_rejects_missing_folder(
+            cx: &mut TestAppContext,
+        ) {
+            init_test(cx);
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree(path!("/root"), json!({ "main": {}, "one": {}, "two": {} }))
+                .await;
+            let project = Project::test(fs, [path!("/root/main").as_ref()], cx).await;
+            let (workspace, cx) =
+                cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+            let first = workspace.update_in(cx, |workspace, window, cx| {
+                workspace.switch_worktree_in_place(PathBuf::from(path!("/root/one")), window, cx)
+            });
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.switch_worktree_in_place(
+                        PathBuf::from(path!("/root/two")),
+                        window,
+                        cx,
+                    )
+                })
+                .await
+                .unwrap();
+            first.await.unwrap();
+            assert_eq!(
+                project.read_with(cx, |project, cx| project
+                    .visible_worktrees(cx)
+                    .next()
+                    .unwrap()
+                    .read(cx)
+                    .abs_path()
+                    .to_path_buf()),
+                PathBuf::from(path!("/root/two"))
+            );
+            let error = workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.switch_worktree_in_place(
+                        PathBuf::from(path!("/root/missing")),
+                        window,
+                        cx,
+                    )
+                })
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("does not exist"));
+            assert_eq!(
+                project.read_with(cx, |project, cx| project
+                    .visible_worktrees(cx)
+                    .next()
+                    .unwrap()
+                    .read(cx)
+                    .abs_path()
+                    .to_path_buf()),
+                PathBuf::from(path!("/root/two"))
+            );
+            workspace.read_with(cx, |workspace, _| {
+                assert!(workspace.active_worktree_creation.label.is_none())
+            });
+        }
+
+        #[gpui::test]
         async fn test_register_project_item(cx: &mut TestAppContext) {
             init_test(cx);
 
@@ -18863,8 +19260,7 @@ mod tests {
             })
             .unwrap();
         cx.run_until_parked();
-        // The worktree selected before the window opened stays unfollowed.
-        assert_eq!(*switches.borrow(), Vec::<PathBuf>::new());
+        assert_eq!(*switches.borrow(), vec![PathBuf::from("/opened")]);
 
         let write_status = async |contents: &str| {
             fs.write(status_path, contents.as_bytes()).await.unwrap();
@@ -18881,7 +19277,10 @@ mod tests {
         ))
         .await;
         cx.run_until_parked();
-        assert_eq!(*switches.borrow(), vec![PathBuf::from("/root.worktrees/1")]);
+        assert_eq!(
+            *switches.borrow(),
+            vec![PathBuf::from("/opened"), PathBuf::from("/root.worktrees/1")]
+        );
     }
 
     fn pane_items_paths(pane: &Entity<Pane>, cx: &App) -> Vec<String> {
