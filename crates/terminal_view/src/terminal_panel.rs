@@ -154,7 +154,10 @@ impl TerminalPanel {
             project,
             window,
             |terminal_panel, project, event, window, cx| {
-                if matches!(event, project::Event::WorktreeAdded(_)) {
+                if matches!(
+                    event,
+                    project::Event::WorktreeAdded(_) | project::Event::WorktreeRemoved(_)
+                ) {
                     terminal_panel.start_control_watcher(project.clone(), window, cx);
                 }
             },

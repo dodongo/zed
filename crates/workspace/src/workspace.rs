@@ -2672,15 +2672,15 @@ impl Workspace {
                     this.update(cx, |workspace, _| workspace.pending_worktree_switch.take())?
                 {
                     let project = this.read_with(cx, |workspace, _| workspace.project.clone())?;
-                    let old_root = project
-                        .read_with(cx, |project, cx| project.visible_worktrees(cx).next())?;
+                    let old_root =
+                        project.read_with(cx, |project, cx| project.visible_worktrees(cx).next());
                     let Some(old_root) = old_root else {
                         return Err(anyhow!(
                             "Cannot switch a workspace without a project folder"
                         ));
                     };
                     let (old_id, old_path) =
-                        old_root.read_with(cx, |root, _| (root.id(), root.abs_path()))?;
+                        old_root.read_with(cx, |root, _| (root.id(), root.abs_path()));
                     if old_path.as_ref() == path {
                         continue;
                     }
@@ -2722,9 +2722,10 @@ impl Workspace {
                                 if let Some(path) = item.project_path(cx)
                                     && path.worktree_id == old_id
                                 {
-                                    if !paths.iter().any(|saved: &RelPathBuf| {
-                                        saved.as_ref() == path.path.as_ref()
-                                    }) {
+                                    if !paths
+                                        .iter()
+                                        .any(|saved: &RelPathBuf| saved == path.path.as_ref())
+                                    {
                                         paths.push(path.path.as_ref().to_owned());
                                     }
                                     closing_items.insert(item.item_id());
@@ -2768,11 +2769,24 @@ impl Workspace {
                         })?;
                         break;
                     }
-                    let new_root = project
-                        .update(cx, |project, cx| project.create_worktree(&path, true, cx))
-                        .await?;
-                    let new_id = new_root.read_with(cx, |root, _| root.id())?;
-                    project.update(cx, |project, cx| project.remove_worktree(old_id, cx));
+                    let existing_root = project.read_with(cx, |project, cx| {
+                        project
+                            .visible_worktrees(cx)
+                            .find(|root| root.read(cx).abs_path().as_ref() == path)
+                    });
+                    let new_root = if let Some(root) = existing_root {
+                        root
+                    } else {
+                        project
+                            .update(cx, |project, cx| project.create_worktree(&path, true, cx))
+                            .await?
+                    };
+                    let new_id = new_root.read_with(cx, |root, _| root.id());
+                    project.update(cx, |project, cx| {
+                        project.move_worktree(new_id, old_id, cx)?;
+                        project.remove_worktree(old_id, cx);
+                        anyhow::Ok(())
+                    })?;
                     for path in saved.paths {
                         let project_path = ProjectPath {
                             worktree_id: new_id,
@@ -2865,26 +2879,7 @@ impl Workspace {
         size_state: dock::PanelSizeState,
         cx: &mut App,
     ) {
-        let Some(workspace_id) = self
-            .database_id()
-            .map(|id| i64::from(id).to_string())
-            .or(self.session_id())
-        else {
-            return;
-        };
-
-        let kvp = db::kvp::KeyValueStore::global(cx);
-        let panel_key = panel_key.to_string();
-        cx.background_spawn(async move {
-            let scope = kvp.scoped(dock::PANEL_SIZE_STATE_KEY);
-            scope
-                .write(
-                    format!("{workspace_id}:{panel_key}"),
-                    serde_json::to_string(&size_state)?,
-                )
-                .await
-        })
-        .detach_and_log_err(cx);
+        Dock::persist_shared_panel_size_state(panel_key, size_state, cx);
     }
 
     pub fn set_panel_size_state<T: Panel>(
@@ -6879,11 +6874,12 @@ impl Workspace {
             return;
         };
         if !self.owns_window_chrome()
-            || self
-                .project
-                .read(cx)
-                .visible_worktrees(cx)
-                .any(|worktree| *worktree.read(cx).abs_path() == *path)
+            || (!self.active_worktree_creation.is_switch
+                && self
+                    .project
+                    .read(cx)
+                    .visible_worktrees(cx)
+                    .any(|worktree| *worktree.read(cx).abs_path() == *path))
         {
             return;
         }
@@ -15632,6 +15628,12 @@ mod tests {
                 );
             });
         }
+    }
+
+    #[gpui::test]
+    async fn test_flexible_panel_size_state_persistence(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
 
         // Flexible panel: both pixel size and ratio are persisted and restored.
         {
@@ -18434,7 +18436,7 @@ mod tests {
                         .project_path(cx)
                         .unwrap()
                         .path,
-                    rel_path("one.png")
+                    rel_path("one.png").into()
                 );
                 assert_eq!(workspace.panel::<TestPanel>(cx), Some(panel.clone()));
                 let kvp = db::kvp::KeyValueStore::global(cx);
@@ -18448,8 +18450,8 @@ mod tests {
                 assert_eq!(
                     saved.paths,
                     vec![
-                        rel_path("one.png").as_ref().to_owned(),
-                        rel_path("two.png").as_ref().to_owned()
+                        rel_path("one.png").to_owned(),
+                        rel_path("two.png").to_owned()
                     ]
                 );
             });
@@ -18469,6 +18471,62 @@ mod tests {
                     vec![PathBuf::from(path!("/root/slot/slot.png"))]
                 );
             });
+        }
+
+        #[gpui::test]
+        async fn test_switch_worktree_in_place_keeps_other_folders(cx: &mut TestAppContext) {
+            init_test(cx);
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree(
+                path!("/root"),
+                json!({ "main": {}, "other": {}, "slot": {} }),
+            )
+            .await;
+            let project = Project::test(
+                fs,
+                [path!("/root/main").as_ref(), path!("/root/other").as_ref()],
+                cx,
+            )
+            .await;
+            let (workspace, cx) =
+                cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.switch_worktree_in_place(
+                        PathBuf::from(path!("/root/slot")),
+                        window,
+                        cx,
+                    )
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                project.read_with(cx, |project, cx| project
+                    .visible_worktrees(cx)
+                    .map(|root| root.read(cx).abs_path().to_path_buf())
+                    .collect::<Vec<_>>()),
+                vec![
+                    PathBuf::from(path!("/root/slot")),
+                    PathBuf::from(path!("/root/other"))
+                ]
+            );
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.switch_worktree_in_place(
+                        PathBuf::from(path!("/root/other")),
+                        window,
+                        cx,
+                    )
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                project.read_with(cx, |project, cx| project
+                    .visible_worktrees(cx)
+                    .map(|root| root.read(cx).abs_path().to_path_buf())
+                    .collect::<Vec<_>>()),
+                vec![PathBuf::from(path!("/root/other"))]
+            );
         }
 
         #[gpui::test]
@@ -19226,6 +19284,102 @@ mod tests {
             cx.window_title(),
             Some(format!("◯ {} project", main_emoji.unwrap()))
         );
+    }
+
+    #[gpui::test]
+    async fn test_switch_worktree_in_place_cancels_for_dirty_files(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({ "main": { "dirty.txt": "" }, "slot": {} }),
+        )
+        .await;
+        let project = Project::test(fs, [path!("/root/main").as_ref()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let old_id = project.read_with(cx, |project, cx| {
+            project.visible_worktrees(cx).next().unwrap().read(cx).id()
+        });
+        let item = cx.new(|cx| {
+            TestItem::new(cx)
+                .with_dirty(true)
+                .with_project_items(&[TestProjectItem::new_in_worktree(1, "dirty.txt", old_id, cx)])
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx);
+        });
+        let switch = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.switch_worktree_in_place(PathBuf::from(path!("/root/slot")), window, cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Cancel");
+        switch.await.unwrap();
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.active_item(cx).unwrap().item_id(),
+                item.entity_id()
+            );
+            assert!(workspace.active_worktree_creation.label.is_none());
+        });
+        assert_eq!(
+            project.read_with(cx, |project, cx| project
+                .visible_worktrees(cx)
+                .next()
+                .unwrap()
+                .read(cx)
+                .id()),
+            old_id
+        );
+    }
+
+    #[gpui::test]
+    async fn test_switch_worktree_in_place_watches_the_new_root(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "main": { ".zed": { "window-status.json": r#"{"state":"idle"}"# } },
+                "slot": { ".zed": { "window-status.json": r#"{"state":"idle"}"# } }
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/root/main").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let switches = Rc::new(RefCell::new(Vec::new()));
+        workspace.update(cx, |workspace, _| {
+            let switches = switches.clone();
+            workspace.register_action(move |_, action: &zed_actions::SwitchWorktree, _, _| {
+                switches.borrow_mut().push(action.path.clone());
+            });
+        });
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.switch_worktree_in_place(PathBuf::from(path!("/root/slot")), window, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        fs.write(
+            Path::new(path!("/root/main/.zed/window-status.json")),
+            br#"{"state":"idle","worktree":"/old"}"#,
+        )
+        .await
+        .unwrap();
+        cx.run_until_parked();
+        assert!(switches.borrow().is_empty());
+        fs.write(
+            Path::new(path!("/root/slot/.zed/window-status.json")),
+            br#"{"state":"idle","worktree":"/new"}"#,
+        )
+        .await
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(*switches.borrow(), vec![PathBuf::from("/new")]);
     }
 
     #[gpui::test]

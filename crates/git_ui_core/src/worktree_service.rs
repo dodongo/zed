@@ -1053,8 +1053,7 @@ async fn do_create_worktree(
     })
 }
 
-/// Core workspace opening logic shared by both create and switch flows.
-/// Returns the newly opened workspace entity so callers can do post-open
+/// Opens a newly created worktree's workspace so callers can do post-open
 /// work (e.g., the `create_thread` agent tool spawns a thread inside it).
 async fn open_worktree_workspace(
     all_paths: Vec<PathBuf>,
