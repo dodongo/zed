@@ -508,6 +508,12 @@ pub struct GitSettings {
     ///
     /// Default: None
     pub worktree_list_command: Option<Vec<String>>,
+    /// A background command run for manual picker selections, with the selected
+    /// worktree's absolute path followed by the window's folder paths appended.
+    /// Not run when opening in a new window or automatically following a worktree.
+    ///
+    /// Default: None
+    pub worktree_select_command: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -725,6 +731,7 @@ impl Settings for ProjectSettings {
                 .clone()
                 .unwrap_or_else(|| DEFAULT_WORKTREE_DIRECTORY.to_string()),
             worktree_list_command: git.worktree_list_command.clone(),
+            worktree_select_command: git.worktree_select_command.clone(),
         };
         Self {
             context_servers: project
