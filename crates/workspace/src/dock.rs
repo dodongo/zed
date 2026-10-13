@@ -1275,19 +1275,53 @@ impl Dock {
         }
     }
 
+    pub(crate) fn persist_shared_panel_size_state(
+        panel_key: &str,
+        size_state: PanelSizeState,
+        cx: &mut App,
+    ) {
+        let kvp = KeyValueStore::global(cx);
+        let key = panel_key.to_owned();
+        cx.background_spawn(async move {
+            kvp.scoped(PANEL_SIZE_STATE_KEY)
+                .write(key, serde_json::to_string(&size_state)?)
+                .await
+        })
+        .detach_and_log_err(cx);
+
+        let panel_key = panel_key.to_owned();
+        cx.defer(move |cx| {
+            let mut docks = Vec::new();
+            for window in cx.windows() {
+                if let Some(window) = window.downcast::<crate::MultiWorkspace>() {
+                    if let Some(multi_workspace) = window.read(cx).log_err() {
+                        for workspace in multi_workspace.workspaces() {
+                            docks.extend(workspace.read(cx).all_docks().map(Entity::clone));
+                        }
+                    }
+                } else if let Some(window) = window.downcast::<Workspace>() {
+                    if let Some(workspace) = window.read(cx).log_err() {
+                        docks.extend(workspace.all_docks().map(Entity::clone));
+                    }
+                }
+            }
+            for dock in docks {
+                dock.update(cx, |dock, cx| {
+                    dock.set_keyed_panel_size_state(&panel_key, size_state, cx);
+                });
+            }
+        });
+    }
+
     pub(crate) fn load_persisted_size_state(
-        workspace: &Workspace,
+        _workspace: &Workspace,
         panel_key: &'static str,
         cx: &App,
     ) -> Option<PanelSizeState> {
-        let workspace_id = workspace
-            .database_id()
-            .map(|id| i64::from(id).to_string())
-            .or(workspace.session_id())?;
         let kvp = KeyValueStore::global(cx);
         let scope = kvp.scoped(PANEL_SIZE_STATE_KEY);
         scope
-            .read(&format!("{workspace_id}:{panel_key}"))
+            .read(panel_key)
             .log_err()
             .flatten()
             .and_then(|json| serde_json::from_str::<PanelSizeState>(&json).log_err())
@@ -1795,5 +1829,200 @@ pub mod test {
         fn focus_handle(&self, _cx: &App) -> FocusHandle {
             self.focus_handle.clone()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{test::TestPanel, *};
+    use crate::MultiWorkspace;
+    use fs::FakeFs;
+    use gpui::TestAppContext;
+    use project::Project;
+
+    #[gpui::test]
+    async fn shared_panel_size_reaches_inactive_workspaces_and_other_windows(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
+            cx.set_global(db::AppDatabase::test_new());
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let source = multi_workspace
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let project = Project::test(fs.clone(), [], cx).await;
+        let inactive = multi_workspace
+            .update(cx, |mw, window, cx| {
+                let inactive = mw.test_add_workspace(project, window, cx);
+                mw.activate(source.clone(), None, window, cx);
+                inactive
+            })
+            .unwrap();
+        multi_workspace
+            .update(cx, |_, window, cx| {
+                for (workspace, position, open) in [
+                    (&source, DockPosition::Right, true),
+                    (&inactive, DockPosition::Left, false),
+                ] {
+                    workspace.update(cx, |workspace, cx| {
+                        let panel = cx.new(|cx| TestPanel::new(position, 100, cx));
+                        workspace.add_panel(panel, window, cx);
+                        workspace.dock_at_position(position).update(cx, |dock, cx| {
+                            dock.activate_panel(0, window, cx);
+                            dock.set_open(open, window, cx);
+                        });
+                    });
+                }
+            })
+            .unwrap();
+
+        let project = Project::test(fs, [], cx).await;
+        let other_window = cx.add_window(|window, cx| Workspace::test_new(project, window, cx));
+        other_window
+            .update(cx, |workspace, window, cx| {
+                let panel = cx.new(|cx| TestPanel::new(DockPosition::Bottom, 100, cx));
+                workspace.add_panel(panel, window, cx);
+                workspace.bottom_dock().update(cx, |dock, cx| {
+                    dock.activate_panel(0, window, cx);
+                    dock.set_open(false, window, cx);
+                });
+            })
+            .unwrap();
+
+        let size_state = PanelSizeState {
+            size: Some(px(432.)),
+            flex: Some(0.35),
+        };
+        multi_workspace
+            .update(cx, |_, _, cx| {
+                source.update(cx, |workspace, cx| {
+                    workspace.right_dock().update(cx, |_, cx| {
+                        Dock::persist_shared_panel_size_state(
+                            TestPanel::panel_key(),
+                            size_state,
+                            cx,
+                        );
+                    });
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        multi_workspace
+            .read_with(cx, |mw, cx| {
+                assert_eq!(mw.workspace(), &source);
+                for (workspace, position, open) in [
+                    (&source, DockPosition::Right, true),
+                    (&inactive, DockPosition::Left, false),
+                ] {
+                    let workspace = workspace.read(cx);
+                    assert_eq!(
+                        workspace.panel_size_state::<TestPanel>(cx),
+                        Some(size_state)
+                    );
+                    let dock = workspace.dock_at_position(position).read(cx);
+                    assert_eq!(dock.is_open(), open);
+                    assert_eq!(dock.panels_len(), 1);
+                    assert_eq!(dock.active_panel_index(), Some(0));
+                }
+            })
+            .unwrap();
+        other_window
+            .read_with(cx, |workspace, cx| {
+                assert_eq!(
+                    workspace.panel_size_state::<TestPanel>(cx),
+                    Some(size_state)
+                );
+                let dock = workspace.bottom_dock().read(cx);
+                assert!(!dock.is_open());
+                assert_eq!(dock.panels_len(), 1);
+                assert_eq!(dock.active_panel_index(), Some(0));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn shared_panel_size_persistence_uses_panel_key(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
+            cx.set_global(db::AppDatabase::test_new());
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let workspace = cx.add_window(|window, cx| Workspace::test_new(project, window, cx));
+        workspace
+            .update(cx, |workspace, _, _| workspace.set_random_database_id())
+            .unwrap();
+        let workspace_key = workspace
+            .read_with(cx, |workspace, _| {
+                format!(
+                    "{}:{}",
+                    i64::from(workspace.database_id().unwrap()),
+                    TestPanel::panel_key()
+                )
+            })
+            .unwrap();
+        let old_size_state = PanelSizeState {
+            size: Some(px(100.)),
+            flex: None,
+        };
+        let kvp = cx.read(KeyValueStore::global);
+        kvp.scoped(PANEL_SIZE_STATE_KEY)
+            .write(
+                workspace_key.clone(),
+                serde_json::to_string(&old_size_state).unwrap(),
+            )
+            .await
+            .unwrap();
+        let size_state = PanelSizeState {
+            size: Some(px(543.)),
+            flex: Some(0.45),
+        };
+        workspace
+            .update(cx, |_, _, cx| {
+                Dock::persist_shared_panel_size_state(TestPanel::panel_key(), size_state, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let scope = kvp.scoped("dock_panel_size");
+        assert_eq!(
+            scope.read(TestPanel::panel_key()).unwrap(),
+            Some(serde_json::to_string(&size_state).unwrap())
+        );
+        assert_eq!(
+            scope.read(&workspace_key).unwrap(),
+            Some(serde_json::to_string(&old_size_state).unwrap())
+        );
+        workspace
+            .read_with(cx, |workspace, cx| {
+                assert_eq!(
+                    Dock::load_persisted_size_state(workspace, TestPanel::panel_key(), cx),
+                    Some(size_state)
+                );
+            })
+            .unwrap();
+
+        let project = Project::test(fs, [], cx).await;
+        let new_workspace = cx.add_window(|window, cx| Workspace::test_new(project, window, cx));
+        new_workspace
+            .update(cx, |workspace, window, cx| {
+                let panel = cx.new(|cx| TestPanel::new(DockPosition::Right, 100, cx));
+                workspace.add_panel(panel, window, cx);
+                assert_eq!(
+                    workspace.panel_size_state::<TestPanel>(cx),
+                    Some(size_state)
+                );
+            })
+            .unwrap();
     }
 }
