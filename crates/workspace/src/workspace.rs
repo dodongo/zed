@@ -2277,6 +2277,7 @@ impl Workspace {
                             );
 
                             workspace.centered_layout = centered_layout;
+                            workspace.opening_items = true;
 
                             // Call init callback to add items before window renders
                             if let Some(init) = init {
@@ -2340,6 +2341,7 @@ impl Workspace {
                                     cx,
                                 );
                                 workspace.centered_layout = centered_layout;
+                                workspace.opening_items = true;
 
                                 // Call init callback to add items before window renders
                                 if let Some(init) = init {
@@ -6885,6 +6887,9 @@ impl Workspace {
 
     /// Switches the window to the selected worktree once its initial editor items are ready.
     fn follow_window_worktree(&mut self, window: &mut Window, cx: &mut App) {
+        if !self.owns_window_chrome() {
+            return;
+        }
         let Some(path) = self.window_status.worktree.clone() else {
             return;
         };
@@ -6892,13 +6897,12 @@ impl Workspace {
             self.pending_worktree_switch = Some(path);
             return;
         }
-        if !self.owns_window_chrome()
-            || (!self.active_worktree_creation.is_switch
-                && self
-                    .project
-                    .read(cx)
-                    .visible_worktrees(cx)
-                    .any(|worktree| *worktree.read(cx).abs_path() == *path))
+        if !self.active_worktree_creation.is_switch
+            && self
+                .project
+                .read(cx)
+                .visible_worktrees(cx)
+                .any(|worktree| *worktree.read(cx).abs_path() == *path)
         {
             return;
         }
@@ -11216,6 +11220,7 @@ pub fn open_workspace_by_id(
                         cx,
                     );
                     workspace.centered_layout = centered_layout;
+                    workspace.opening_items = true;
                     workspace
                 });
                 multi_workspace.add(workspace.clone(), &*window, cx);
@@ -11256,6 +11261,7 @@ pub fn open_workspace_by_id(
                             cx,
                         );
                         workspace.centered_layout = centered_layout;
+                        workspace.opening_items = true;
                         workspace
                     });
                     cx.new(|cx| MultiWorkspace::new(workspace, window, cx))
@@ -11698,6 +11704,7 @@ async fn open_remote_project_inner(
                 cx,
             );
             workspace.update_history(cx);
+            workspace.opening_items = true;
 
             if let Some(ref serialized) = serialized_workspace {
                 workspace.centered_layout = serialized.centered_layout;
@@ -18523,10 +18530,13 @@ mod tests {
             })).await;
             let project = Project::test(fs.clone(), [path!("/root/main").as_ref()], cx).await;
             let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
-                MultiWorkspace::test_new(project.clone(), window, cx)
+                let multi_workspace = MultiWorkspace::test_new(project.clone(), window, cx);
+                multi_workspace
+                    .workspace()
+                    .update(cx, |workspace, _| workspace.opening_items = true);
+                multi_workspace
             });
             let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
-            workspace.update(cx, |workspace, _| workspace.opening_items = true);
             cx.run_until_parked();
             let old_id = project.read_with(cx, |project, cx| {
                 project.visible_worktrees(cx).next().unwrap().read(cx).id()
@@ -19462,12 +19472,13 @@ mod tests {
         let panes = workspace.update_in(cx, |workspace, window, cx| {
             for (index, path) in ["one.txt", "two.txt"].into_iter().enumerate() {
                 if index > 0 {
-                    workspace.split_pane(
+                    let pane = workspace.split_pane(
                         workspace.active_pane().clone(),
                         SplitDirection::Right,
                         window,
                         cx,
                     );
+                    workspace.set_active_pane(&pane, window, cx);
                 }
                 let item = cx.new(|cx| {
                     TestItem::new(cx).with_dirty(true).with_project_items(&[
