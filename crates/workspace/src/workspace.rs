@@ -175,6 +175,7 @@ use crate::{
 pub const SERIALIZATION_THROTTLE_TIME: Duration = Duration::from_millis(200);
 pub const MAX_RECENT_SELECTIONS: usize = 20;
 const WINDOW_STATUS_PATH: &str = ".zed/window-status.json";
+const WINDOW_ROOT_STATE_KEY: &str = "herdr_window_root";
 const WORKTREE_OPEN_FILES_STATE_KEY: &str = "worktree_open_files";
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
@@ -215,18 +216,12 @@ fn should_apply_default_new_workspace_layout(
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct WindowStatus {
     emoji: String,
-    /// The worktree the window's Herdr session selected, which the window follows.
-    worktree: Option<PathBuf>,
-    /// The Herdr session's project folder, which the window title names whichever worktree it follows.
-    root: Option<PathBuf>,
 }
 
 impl Default for WindowStatus {
     fn default() -> Self {
         Self {
             emoji: "◯".to_string(),
-            worktree: None,
-            root: None,
         }
     }
 }
@@ -234,8 +229,6 @@ impl Default for WindowStatus {
 #[derive(Deserialize)]
 struct WindowStatusFile {
     state: Option<String>,
-    worktree: Option<PathBuf>,
-    root: Option<PathBuf>,
 }
 
 fn parse_window_status(contents: &str) -> WindowStatus {
@@ -246,8 +239,6 @@ fn parse_window_status(contents: &str) -> WindowStatus {
     let Ok(file) = serde_json::from_str::<WindowStatusFile>(contents) else {
         return WindowStatus {
             emoji: "⚠️".to_string(),
-            worktree: None,
-            root: None,
         };
     };
 
@@ -260,8 +251,6 @@ fn parse_window_status(contents: &str) -> WindowStatus {
     };
     WindowStatus {
         emoji: emoji.to_string(),
-        worktree: file.worktree,
-        root: file.root,
     }
 }
 
@@ -1632,7 +1621,10 @@ pub struct Workspace {
     app_state: Arc<AppState>,
     dispatching_keystrokes: Rc<RefCell<DispatchingKeystrokes>>,
     _subscriptions: Vec<Subscription>,
+    window_root: Option<PathBuf>,
+    window_root_persisted: bool,
     window_status: WindowStatus,
+    has_window_status: bool,
     _window_status_watcher: Option<Task<()>>,
     window_root_branch: Option<String>,
     _window_root_head_watcher: Option<Task<()>>,
@@ -1778,7 +1770,6 @@ impl Workspace {
                 }
 
                 &project::Event::WorktreeRemoved(_) => {
-                    this.start_window_status_watcher(window, cx);
                     this.update_window_title(window, cx);
                     this.serialize_workspace(window, cx);
                     this.update_history(cx);
@@ -2128,7 +2119,10 @@ impl Workspace {
             app_state,
             _observe_current_user,
             _apply_leader_updates,
+            window_root: None,
+            window_root_persisted: false,
             window_status: WindowStatus::default(),
+            has_window_status: false,
             _window_status_watcher: None,
             window_root_branch: None,
             _window_root_head_watcher: None,
@@ -2839,7 +2833,6 @@ impl Workspace {
                                 }
                             }
                         }
-                        workspace.start_window_status_watcher(window, cx);
                         workspace.update_window_title(window, cx);
                         workspace.serialize_workspace(window, cx);
                         cx.notify();
@@ -6860,35 +6853,121 @@ impl Workspace {
         self.update_window_title(window, cx);
     }
 
-    fn start_window_status_watcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self._window_status_watcher.take();
+    /// The project folder whose status belongs to this window, independent of the selected worktree.
+    pub fn window_root(&self) -> Option<&Path> {
+        self.window_root.as_deref()
+    }
 
+    fn persist_window_root(&mut self, cx: &App) {
+        if self.window_root_persisted {
+            return;
+        }
+        let Some((id, root)) = self.database_id.zip(self.window_root.as_ref()) else {
+            return;
+        };
+        let value = match serde_json::to_string(root).log_err() {
+            Some(value) => value,
+            None => return,
+        };
+        let kvp = db::kvp::KeyValueStore::global(cx);
+        self.window_root_persisted = true;
+        db::write_and_log(cx, move || async move {
+            kvp.scoped(WINDOW_ROOT_STATE_KEY)
+                .write(id.0.to_string(), value)
+                .await
+        });
+    }
+
+    fn start_window_status_watcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self._window_status_watcher.is_some() {
+            return;
+        }
         let Some(worktree) = self.project.read(cx).visible_worktrees(cx).next() else {
             return;
         };
-        let path = worktree.read(cx).abs_path().join(WINDOW_STATUS_PATH);
+        let folder = worktree.read(cx).abs_path().to_path_buf();
+        let kvp = db::kvp::KeyValueStore::global(cx);
+        let stored_root: Result<Option<PathBuf>> = self
+            .database_id
+            .map(|id| {
+                kvp.scoped(WINDOW_ROOT_STATE_KEY)
+                    .read(&id.0.to_string())?
+                    .map(|value| serde_json::from_str(&value).map_err(Into::into))
+                    .transpose()
+            })
+            .unwrap_or(Ok(None));
+        let Some(stored_root) = stored_root.log_err() else {
+            return;
+        };
         let fs = self.project.read(cx).fs().clone();
-        let (mut status_rx, watcher) = watch_config_file(cx.background_executor(), fs, path);
+        let executor = cx.background_executor().clone();
 
         self._window_status_watcher = Some(cx.spawn_in(window, async move |this, cx| {
-            let _watcher = watcher;
+            let persisted = stored_root.is_some();
+            let root: Result<PathBuf> = async {
+                if let Some(root) = stored_root {
+                    return Ok(root);
+                }
+                let dot_git = folder.join(".git");
+                if !fs.is_file(&dot_git).await {
+                    return Ok(folder);
+                }
+                let contents = fs.load(&dot_git).await?;
+                let git_dir = contents
+                    .trim()
+                    .strip_prefix("gitdir:")
+                    .map(str::trim)
+                    .filter(|dir| !dir.is_empty())
+                    .context("Invalid git worktree gitdir")?;
+                let git_dir = folder.join(git_dir);
+                let common_dir_path = git_dir.join("commondir");
+                if !fs.is_file(&common_dir_path).await {
+                    return Ok(folder);
+                }
+                let common_dir = fs.load(&common_dir_path).await?;
+                anyhow::ensure!(
+                    !common_dir.trim().is_empty(),
+                    "Empty git worktree commondir"
+                );
+                let common_dir = fs.canonicalize(&git_dir.join(common_dir.trim())).await?;
+                Ok(common_dir
+                    .parent()
+                    .context("Git common directory has no parent")?
+                    .to_path_buf())
+            }
+            .await;
+            let Some(root) = root.log_err() else {
+                return;
+            };
+            let path = root.join(WINDOW_STATUS_PATH);
+            if this
+                .update(cx, |workspace, cx| {
+                    workspace.window_root = Some(root);
+                    workspace.window_root_persisted = persisted;
+                    workspace.persist_window_root(cx);
+                })
+                .is_err()
+            {
+                return;
+            }
+            let (mut status_rx, _watcher) = watch_config_file(&executor, fs.clone(), path.clone());
             while let Some(contents) = status_rx.next().await {
                 let status = parse_window_status(&contents);
+                let has_status = !contents.is_empty() || fs.is_file(&path).await;
                 if this
                     .update_in(cx, |workspace, window, cx| {
-                        if workspace.window_status == status {
+                        if workspace.window_status == status
+                            && workspace.has_window_status == has_status
+                        {
                             return;
                         }
-                        let worktree_changed = workspace.window_status.worktree != status.worktree;
-                        let root_changed = workspace.window_status.root != status.root;
+                        let had_status = workspace.has_window_status;
                         workspace.window_status = status;
-                        if root_changed {
+                        workspace.has_window_status = has_status;
+                        if had_status != has_status {
                             workspace.watch_window_root_head(window, cx);
                         }
                         workspace.update_window_title(window, cx);
-                        if worktree_changed {
-                            workspace.follow_window_worktree(window, cx);
-                        }
                     })
                     .is_err()
                 {
@@ -6898,11 +6977,11 @@ impl Workspace {
         }));
     }
 
-    /// Keeps the window title's branch on the status root's checked-out branch.
+    /// Keeps the window title's branch on the project folder's checked-out branch.
     fn watch_window_root_head(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.window_root_branch = None;
         self._window_root_head_watcher = None;
-        let Some(root) = self.window_status.root.clone() else {
+        let Some(root) = self.window_root.clone().filter(|_| self.has_window_status) else {
             return;
         };
         let fs = self.project.read(cx).fs().clone();
@@ -6937,51 +7016,14 @@ impl Workspace {
         }));
     }
 
-    fn resume_worktree_following(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn resume_pending_worktree_switch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.opening_items || self.restoring_workspace {
             return;
         }
         if let Some(path) = self.pending_worktree_switch.take() {
             self.switch_worktree_in_place(path, window, cx)
                 .detach_and_log_err(cx);
-        } else {
-            self.follow_window_worktree(window, cx);
         }
-    }
-
-    /// Switches the window to the selected worktree once its initial editor items are ready.
-    fn follow_window_worktree(&mut self, window: &mut Window, cx: &mut App) {
-        if !self.owns_window_chrome() {
-            return;
-        }
-        let Some(path) = self.window_status.worktree.clone() else {
-            return;
-        };
-        if self.opening_items || self.restoring_workspace {
-            return;
-        }
-        if !self.active_worktree_creation.is_switch
-            && self
-                .project
-                .read(cx)
-                .visible_worktrees(cx)
-                .any(|worktree| *worktree.read(cx).abs_path() == *path)
-        {
-            return;
-        }
-        let action = zed_actions::SwitchWorktree {
-            display_name: path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            path,
-        };
-        // The pane's focus handle reaches the workspace's action handlers even
-        // when focus is elsewhere in the window.
-        let pane_focus = self.active_pane.focus_handle(cx);
-        window.defer(cx, move |window, cx| {
-            pane_focus.dispatch_action(&action, window, cx)
-        });
     }
 
     /// Whether this workspace may write the platform window's title and edited
@@ -7012,43 +7054,44 @@ impl Workspace {
         let project = self.project().read(cx);
         let mut title = format!("{} ", self.window_status.emoji);
 
-        let branch_name = if let Some(root) = &self.window_status.root {
-            let name = root
-                .file_name()
-                .map(|name| name.to_string_lossy())
-                .unwrap_or_else(|| root.to_string_lossy());
-            title.push_str(identity_emoji(&name, root));
-            title.push(' ');
-            title.push_str(&name);
-            self.window_root_branch.clone()
-        } else {
-            if let Some(identity_emoji) = workspace_identity_emoji(&project, cx) {
-                title.push_str(identity_emoji);
+        let branch_name =
+            if let Some(root) = self.window_root.as_ref().filter(|_| self.has_window_status) {
+                let name = root
+                    .file_name()
+                    .map(|name| name.to_string_lossy())
+                    .unwrap_or_else(|| root.to_string_lossy());
+                title.push_str(identity_emoji(&name, root));
                 title.push(' ');
-            }
-
-            for (i, worktree) in project.visible_worktrees(cx).enumerate() {
-                let worktree = worktree.read(cx);
-                let name = main_worktree_name(project, worktree, cx);
-
-                if i > 0 {
-                    title.push_str(", ");
+                title.push_str(&name);
+                self.window_root_branch.clone()
+            } else {
+                if let Some(identity_emoji) = workspace_identity_emoji(&project, cx) {
+                    title.push_str(identity_emoji);
+                    title.push(' ');
                 }
-                title.push_str(name);
-            }
 
-            if title == format!("{} ", self.window_status.emoji) {
-                title.push_str("empty project");
-            }
+                for (i, worktree) in project.visible_worktrees(cx).enumerate() {
+                    let worktree = worktree.read(cx);
+                    let name = main_worktree_name(project, worktree, cx);
 
-            project.active_repository(cx).and_then(|repository| {
-                repository
-                    .read(cx)
-                    .branch
-                    .as_ref()
-                    .map(|branch| branch.name().to_string())
-            })
-        };
+                    if i > 0 {
+                        title.push_str(", ");
+                    }
+                    title.push_str(name);
+                }
+
+                if title == format!("{} ", self.window_status.emoji) {
+                    title.push_str("empty project");
+                }
+
+                project.active_repository(cx).and_then(|repository| {
+                    repository
+                        .read(cx)
+                        .branch
+                        .as_ref()
+                        .map(|branch| branch.name().to_string())
+                })
+            };
 
         if let Some(branch_name) = branch_name {
             title.push_str(" [");
@@ -7927,7 +7970,8 @@ impl Workspace {
         }
     }
 
-    fn serialize_workspace_internal(&self, window: &mut Window, cx: &mut App) -> Task<()> {
+    fn serialize_workspace_internal(&mut self, window: &mut Window, cx: &mut App) -> Task<()> {
+        self.persist_window_root(cx);
         let Some(database_id) = self.database_id() else {
             return Task::ready(());
         };
@@ -8220,7 +8264,7 @@ impl Workspace {
                 }
 
                 workspace.restoring_workspace = false;
-                workspace.resume_worktree_following(window, cx);
+                workspace.resume_pending_worktree_switch(window, cx);
                 cx.notify();
             })?;
 
@@ -9658,7 +9702,7 @@ fn open_items(
     .then(move |result| async move {
         workspace.update_in(&mut async_cx, |workspace, window, cx| {
             workspace.opening_items = false;
-            workspace.resume_worktree_following(window, cx);
+            workspace.resume_pending_worktree_switch(window, cx);
         })?;
         result
     })
@@ -18597,7 +18641,7 @@ mod tests {
         }
 
         #[gpui::test]
-        async fn test_first_worktree_follow_waits_for_initial_items(cx: &mut TestAppContext) {
+        async fn test_pending_worktree_pick_waits_for_initial_items(cx: &mut TestAppContext) {
             init_test(cx);
             cx.update(register_project_item::<TestPngItemView>);
             let fs = FakeFs::new(cx.executor());
@@ -18610,13 +18654,6 @@ mod tests {
                 let multi_workspace = MultiWorkspace::test_new(project.clone(), window, cx);
                 multi_workspace.workspace().update(cx, |workspace, _| {
                     workspace.opening_items = true;
-                    workspace.register_action(
-                        |workspace, action: &zed_actions::SwitchWorktree, window, cx| {
-                            workspace
-                                .switch_worktree_in_place(action.path.clone(), window, cx)
-                                .detach_and_log_err(cx);
-                        },
-                    );
                 });
                 multi_workspace
             });
@@ -18625,12 +18662,21 @@ mod tests {
             let old_id = project.read_with(cx, |project, cx| {
                 project.visible_worktrees(cx).next().unwrap().read(cx).id()
             });
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.switch_worktree_in_place(
+                        PathBuf::from(path!("/root/slot")),
+                        window,
+                        cx,
+                    )
+                })
+                .await
+                .unwrap();
             workspace.read_with(cx, |workspace, _| {
                 assert_eq!(
-                    workspace.window_status.worktree,
-                    Some(PathBuf::from(path!("/root/slot")))
+                    workspace.pending_worktree_switch.as_deref(),
+                    Some(Path::new(path!("/root/slot")))
                 );
-                assert!(workspace.pending_worktree_switch.is_none());
                 assert!(workspace.active_worktree_creation.label.is_none());
             });
             workspace
@@ -18641,7 +18687,7 @@ mod tests {
                 .unwrap();
             workspace.update_in(cx, |workspace, window, cx| {
                 workspace.opening_items = false;
-                workspace.resume_worktree_following(window, cx);
+                workspace.resume_pending_worktree_switch(window, cx);
             });
             cx.run_until_parked();
             assert_eq!(
@@ -18679,7 +18725,7 @@ mod tests {
         }
 
         #[gpui::test]
-        async fn test_initial_worktree_follow_does_not_switch_a_background_workspace(
+        async fn test_initial_status_does_not_switch_a_background_workspace(
             cx: &mut TestAppContext,
         ) {
             init_test(cx);
@@ -18707,7 +18753,7 @@ mod tests {
             });
             initial.update_in(cx, |workspace, window, cx| {
                 workspace.opening_items = false;
-                workspace.resume_worktree_following(window, cx);
+                workspace.resume_pending_worktree_switch(window, cx);
             });
             cx.run_until_parked();
             assert_eq!(
@@ -19753,28 +19799,21 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_switch_worktree_in_place_watches_the_new_root(cx: &mut TestAppContext) {
+    async fn test_switch_worktree_in_place_keeps_watching_the_window_root(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
             path!("/root"),
             json!({
-                "main": { ".zed": { "window-status.json": r#"{"state":"idle"}"# } },
-                "slot": { ".zed": { "window-status.json": r#"{"state":"idle"}"# } }
+                "main": { ".zed": { "window-status.json": r#"{"state":"running"}"# } },
+                "slot": { ".zed": { "window-status.json": r#"{"state":"failure"}"# } }
             }),
         )
         .await;
         let project = Project::test(fs.clone(), [path!("/root/main").as_ref()], cx).await;
-        let (multi_workspace, cx) =
-            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
-        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
-        let switches = Rc::new(RefCell::new(Vec::new()));
-        workspace.update(cx, |workspace, _| {
-            let switches = switches.clone();
-            workspace.register_action(move |_, action: &zed_actions::SwitchWorktree, _, _| {
-                switches.borrow_mut().push(action.path.clone());
-            });
-        });
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        cx.run_until_parked();
         workspace
             .update_in(cx, |workspace, window, cx| {
                 workspace.switch_worktree_in_place(PathBuf::from(path!("/root/slot")), window, cx)
@@ -19782,26 +19821,47 @@ mod tests {
             .await
             .unwrap();
         cx.run_until_parked();
-        fs.write(
-            Path::new(path!("/root/main/.zed/window-status.json")),
-            br#"{"state":"idle","worktree":"/old"}"#,
-        )
-        .await
-        .unwrap();
-        cx.run_until_parked();
-        assert!(switches.borrow().is_empty());
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                workspace.window_root(),
+                Some(Path::new(path!("/root/main")))
+            );
+            assert_eq!(workspace.window_status.emoji, "◐");
+        });
         fs.write(
             Path::new(path!("/root/slot/.zed/window-status.json")),
-            br#"{"state":"idle","worktree":"/new"}"#,
+            br#"{"state":"idle","worktree":"/new","root":"/other"}"#,
         )
         .await
         .unwrap();
         cx.run_until_parked();
-        assert_eq!(*switches.borrow(), vec![PathBuf::from("/new")]);
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.window_status.emoji, "◐")
+        });
+        fs.write(
+            Path::new(path!("/root/main/.zed/window-status.json")),
+            br#"{"state":"success","worktree":"/old","root":"/other"}"#,
+        )
+        .await
+        .unwrap();
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.window_status.emoji, "◉")
+        });
+        assert_eq!(
+            project.read_with(cx, |project, cx| project
+                .visible_worktrees(cx)
+                .next()
+                .unwrap()
+                .read(cx)
+                .abs_path()
+                .to_path_buf()),
+            PathBuf::from(path!("/root/slot"))
+        );
     }
 
     #[gpui::test]
-    async fn test_window_follows_the_worktree_its_status_selects(cx: &mut TestAppContext) {
+    async fn test_window_status_never_switches_worktrees(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
         let status_path = Path::new(path!("/root/.zed/window-status.json"));
@@ -19815,72 +19875,227 @@ mod tests {
         .await;
 
         let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let multi_workspace_handle =
-            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-        let cx = &mut VisualTestContext::from_window(multi_workspace_handle.into(), cx);
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
         let switches = Rc::new(RefCell::new(Vec::new()));
-        multi_workspace_handle
-            .update(cx, |multi_workspace, _, cx| {
-                let switches = switches.clone();
-                multi_workspace.workspace().update(cx, |workspace, _| {
-                    workspace.register_action(
-                        move |_, action: &zed_actions::SwitchWorktree, _, _| {
-                            switches.borrow_mut().push(action.path.clone());
-                        },
-                    );
-                });
-            })
-            .unwrap();
+        workspace.update(cx, |workspace, _| {
+            let switches = switches.clone();
+            workspace.register_action(move |_, action: &zed_actions::SwitchWorktree, _, _| {
+                switches.borrow_mut().push(action.path.clone());
+            });
+        });
         cx.run_until_parked();
-        assert_eq!(*switches.borrow(), vec![PathBuf::from("/opened")]);
+        assert!(switches.borrow().is_empty());
 
-        let write_status = async |contents: &str| {
+        for contents in [
+            r#"{"state":"idle","worktree":"/root.worktrees/1"}"#,
+            r#"{"state":"running","worktree":"/root.worktrees/2","root":"/other"}"#,
+            r#"{"state":"success","worktree":{"invalid":"ignored"},"root":42}"#,
+        ] {
             fs.write(status_path, contents.as_bytes()).await.unwrap();
-        };
-        write_status(r#"{"state": "idle", "worktree": "/root.worktrees/1"}"#).await;
-        cx.run_until_parked();
-        // A status change that keeps the worktree does not switch again.
-        write_status(r#"{"state": "running", "worktree": "/root.worktrees/1"}"#).await;
-        cx.run_until_parked();
-        // The window already shows its own folder.
-        write_status(&format!(
-            r#"{{"state": "running", "worktree": "{}"}}"#,
-            path!("/root")
-        ))
-        .await;
-        cx.run_until_parked();
+            cx.run_until_parked();
+            assert!(switches.borrow().is_empty());
+        }
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.window_status.emoji, "◉");
+            assert_eq!(workspace.window_root(), Some(Path::new(path!("/root"))));
+            assert!(workspace.pending_worktree_switch.is_none());
+        });
         assert_eq!(
-            *switches.borrow(),
-            vec![PathBuf::from("/opened"), PathBuf::from("/root.worktrees/1")]
+            project.read_with(cx, |project, cx| project
+                .visible_worktrees(cx)
+                .next()
+                .unwrap()
+                .read(cx)
+                .abs_path()
+                .to_path_buf()),
+            PathBuf::from(path!("/root"))
         );
     }
 
     #[gpui::test]
-    async fn test_window_title_names_the_status_root_and_its_branch(cx: &mut TestAppContext) {
+    async fn test_linked_worktree_window_root_uses_main_worktree(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
-            path!("/home"),
-            json!({ ".git": { "HEAD": "ref: refs/heads/develop\n" } }),
-        )
-        .await;
-        fs.insert_tree(
-            path!("/slot"),
+            path!("/root"),
             json!({
-                ".zed": {
-                    "window-status.json": format!(
-                        r#"{{"state": "running", "worktree": "{}", "root": "{}"}}"#,
-                        path!("/slot"),
-                        path!("/home")
-                    )
+                "main": {
+                    ".git": {
+                        "worktrees": { "slot": { "commondir": "../.." } }
+                    },
+                    ".zed": { "window-status.json": r#"{"state":"running"}"# }
+                },
+                "slot": {
+                    ".git": "gitdir: ../main/.git/worktrees/slot\n",
+                    ".zed": { "window-status.json": r#"{"state":"failure"}"# }
                 }
             }),
         )
         .await;
+        let project = Project::test(fs, [path!("/root/slot").as_ref()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                workspace.window_root(),
+                Some(Path::new(path!("/root/main")))
+            );
+            assert_eq!(workspace.window_status.emoji, "◐");
+        });
+        assert_eq!(
+            project.read_with(cx, |project, cx| project
+                .visible_worktrees(cx)
+                .next()
+                .unwrap()
+                .read(cx)
+                .abs_path()
+                .to_path_buf()),
+            PathBuf::from(path!("/root/slot"))
+        );
+    }
 
-        let project = Project::test(fs.clone(), [path!("/slot").as_ref()], cx).await;
-        let (_workspace, cx) =
+    #[gpui::test]
+    async fn test_window_root_survives_folder_changes_and_persists_when_id_is_known(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({ "main": {}, "other": {} }))
+            .await;
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.window_root().is_none())
+        });
+        let first = project
+            .update(cx, |project, cx| {
+                project.create_worktree(Path::new(path!("/root/main")), true, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        let first_id = first.read_with(cx, |worktree, _| worktree.id());
+        project.update(cx, |project, cx| project.remove_worktree(first_id, cx));
+        project
+            .update(cx, |project, cx| {
+                project.create_worktree(Path::new(path!("/root/other")), true, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                workspace.window_root(),
+                Some(Path::new(path!("/root/main")))
+            );
+        });
+        let id = WorkspaceId(43);
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.set_database_id(id);
+                workspace.flush_serialization(window, cx)
+            })
+            .await;
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.window_root(),
+                Some(Path::new(path!("/root/main")))
+            );
+            let kvp = db::kvp::KeyValueStore::global(cx);
+            let stored = kvp
+                .scoped(WINDOW_ROOT_STATE_KEY)
+                .read(&id.0.to_string())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<PathBuf>(&stored).unwrap(),
+                PathBuf::from(path!("/root/main"))
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_stored_window_root_wins_over_the_open_folder(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "main": { ".zed": { "window-status.json": r#"{"state":"running"}"# } },
+                "slot": { ".zed": { "window-status.json": r#"{"state":"failure"}"# } }
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/root/main").as_ref()], cx).await;
+        let id = WorkspaceId(42);
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            let mut workspace = Workspace::test_new(project, window, cx);
+            workspace.set_database_id(id);
+            workspace
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.window_root(),
+                Some(Path::new(path!("/root/main")))
+            );
+            let kvp = db::kvp::KeyValueStore::global(cx);
+            let stored = kvp
+                .scoped(WINDOW_ROOT_STATE_KEY)
+                .read(&id.0.to_string())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<PathBuf>(&stored).unwrap(),
+                PathBuf::from(path!("/root/main"))
+            );
+        });
+        let project = Project::test(fs, [path!("/root/slot").as_ref()], cx).await;
+        let (restored, cx) = cx.add_window_view(|window, cx| {
+            let mut workspace = Workspace::test_new(project, window, cx);
+            workspace.set_database_id(id);
+            workspace
+        });
+        cx.run_until_parked();
+        restored.read_with(cx, |workspace, _| {
+            assert_eq!(
+                workspace.window_root(),
+                Some(Path::new(path!("/root/main")))
+            );
+            assert_eq!(workspace.window_status.emoji, "◐");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_window_title_names_the_window_root_and_its_branch(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/home"),
+            json!({
+                ".git": { "HEAD": "ref: refs/heads/develop\n" },
+                ".zed": { "window-status.json": r#"{"state":"running","root":"/ignored"}"# }
+            }),
+        )
+        .await;
+        fs.insert_tree(path!("/slot"), json!({})).await;
+
+        let project = Project::test(fs.clone(), [path!("/home").as_ref()], cx).await;
+        let (workspace, cx) =
             cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        cx.run_until_parked();
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.switch_worktree_in_place(PathBuf::from(path!("/slot")), window, cx)
+            })
+            .await
+            .unwrap();
         cx.run_until_parked();
         let emoji = identity_emoji("home", Path::new(path!("/home")));
         assert_eq!(

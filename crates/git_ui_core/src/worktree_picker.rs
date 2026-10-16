@@ -119,7 +119,11 @@ impl WorktreePicker {
             .git
             .worktree_list_command
             .clone();
-        let mut window_folders: Vec<PathBuf> = active_worktree_paths.iter().cloned().collect();
+        let mut window_folders: Vec<PathBuf> = workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).window_root().map(Path::to_path_buf))
+            .map(|root| vec![root])
+            .unwrap_or_else(|| active_worktree_paths.iter().cloned().collect());
         window_folders.sort();
 
         let delegate = WorktreePickerDelegate {
