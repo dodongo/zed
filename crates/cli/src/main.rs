@@ -70,6 +70,14 @@ struct Args {
     /// When opening a directory, waits until the created window is closed.
     #[arg(short, long)]
     wait: bool,
+    /// Close the window for this project root, waiting until it closes.
+    #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::DirPath,
+        conflicts_with_all = ["switch_worktree", "paths_with_position", "diff", "wait", "add", "new", "reuse", "existing", "classic", "dev_container", "foreground"])]
+    close: Option<PathBuf>,
+    /// Switch a window showing the same Git repository to this worktree.
+    #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::DirPath,
+        conflicts_with_all = ["paths_with_position", "diff", "wait", "add", "new", "reuse", "existing", "classic", "dev_container", "foreground"])]
+    switch_worktree: Option<PathBuf>,
     /// Add files to the currently open workspace
     #[arg(short, long, overrides_with_all = ["new", "reuse", "existing", "classic"])]
     add: bool,
@@ -337,6 +345,30 @@ mod tests {
         let result = f();
         env::set_current_dir(old_cwd)?;
         result
+    }
+
+    #[test]
+    fn test_window_command_flags() {
+        let close = Args::try_parse_from(["zed", "--close", "/project"]).unwrap();
+        assert_eq!(close.close, Some(PathBuf::from("/project")));
+        let switch = Args::try_parse_from(["zed", "--switch-worktree", "/worktree"]).unwrap();
+        assert_eq!(switch.switch_worktree, Some(PathBuf::from("/worktree")));
+        for args in [
+            vec![
+                "zed",
+                "--close",
+                "/project",
+                "--switch-worktree",
+                "/worktree",
+            ],
+            vec!["zed", "--close", "/project", "file.txt"],
+            vec!["zed", "--switch-worktree", "/worktree", "--new"],
+            vec!["zed", "--close", "/project", "--wait"],
+            vec!["zed", "--close"],
+            vec!["zed", "--switch-worktree"],
+        ] {
+            assert!(Args::try_parse_from(args).is_err());
+        }
     }
 
     #[test]
@@ -631,6 +663,20 @@ fn run() -> Result<()> {
         }
     };
 
+    let window_request = if let Some(path) = &args.close {
+        Some(CliRequest::Close {
+            path: fs::canonicalize(path)
+                .with_context(|| format!("resolving project root {}", path.display()))?,
+        })
+    } else if let Some(path) = &args.switch_worktree {
+        Some(CliRequest::SwitchWorktree {
+            path: fs::canonicalize(path)
+                .with_context(|| format!("resolving worktree {}", path.display()))?,
+        })
+    } else {
+        None
+    };
+
     let exit_status = Arc::new(Mutex::new(None));
     let mut paths = vec![];
     let mut urls = vec![];
@@ -717,7 +763,7 @@ fn run() -> Result<()> {
                 #[cfg(not(target_os = "windows"))]
                 let wsl = None;
 
-                let open_request = CliRequest::Open {
+                let request = window_request.unwrap_or_else(|| CliRequest::Open {
                     paths,
                     urls,
                     diff_paths,
@@ -729,9 +775,9 @@ fn run() -> Result<()> {
                     user_data_dir: user_data_dir_for_thread,
                     dev_container: args.dev_container,
                     cwd: env::current_dir().ok(),
-                };
+                });
 
-                tx.send(open_request)?;
+                tx.send(request)?;
 
                 while let Ok(response) = rx.recv() {
                     match response {

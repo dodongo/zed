@@ -15,7 +15,7 @@ use futures::future;
 use futures::{FutureExt, StreamExt};
 use git_ui::multi_diff_view::MultiDiffView;
 use git_ui_core::file_diff_view::FileDiffView;
-use gpui::{App, AsyncApp, Global, TaskExt, WindowHandle};
+use gpui::{App, AppContext as _, AsyncApp, Global, TaskExt, WindowHandle};
 use onboarding::FIRST_OPEN;
 use onboarding::show_onboarding_view;
 use recent_projects::{RemoteSettings, navigate_to_positions, open_remote_project};
@@ -582,6 +582,149 @@ pub async fn handle_cli_connection(
 ) {
     if let Some(request) = requests.next().await {
         match request {
+            CliRequest::Close { path } => {
+                let result: Result<()> = async {
+                    let path = app_state.fs.canonicalize(&path).await?;
+                    let windows = cx.update(|cx| {
+                        cx.windows()
+                            .into_iter()
+                            .filter_map(|window| window.downcast::<MultiWorkspace>())
+                            .filter_map(|window| {
+                                let workspace = window.read(cx).ok()?.workspace().read(cx);
+                                if !workspace.project().read(cx).is_local() {
+                                    return None;
+                                }
+                                Some((window, workspace.project_root(cx)?))
+                            })
+                            .collect::<Vec<_>>()
+                    });
+                    for (window, root) in windows {
+                        if app_state
+                            .fs
+                            .canonicalize(&root)
+                            .await
+                            .is_ok_and(|root| root == path)
+                        {
+                            anyhow::ensure!(
+                                workspace::close_window(window, cx).await?,
+                                "window close cancelled"
+                            );
+                            return Ok(());
+                        }
+                    }
+                    anyhow::bail!("no Zed window for {}", path.display());
+                }
+                .await;
+                let status = if let Err(error) = result {
+                    responses
+                        .send(CliResponse::Stderr {
+                            message: format!("{error:#}"),
+                        })
+                        .log_err();
+                    1
+                } else {
+                    0
+                };
+                responses.send(CliResponse::Exit { status }).log_err();
+            }
+            CliRequest::SwitchWorktree { path } => {
+                let result: Result<()> = async {
+                    let path = app_state.fs.canonicalize(&path).await?;
+                    anyhow::ensure!(app_state.fs.is_dir(&path).await, "{} is not a Git worktree root", path.display());
+                    let dot_git = path.join(".git");
+                    anyhow::ensure!(
+                        app_state.fs.metadata(&dot_git).await?.is_some(),
+                        "{} is not a Git worktree root",
+                        path.display()
+                    );
+                    let fs = app_state.fs.clone();
+                    let repository = cx
+                        .background_spawn(async move { fs.open_repo(&dot_git, None) })
+                        .await
+                        .with_context(|| format!("opening Git worktree at {}", path.display()))?;
+                    let worktrees = repository.worktrees().await?;
+                    let mut roots = Vec::new();
+                    for worktree in worktrees {
+                        if let Some(metadata) = app_state.fs.metadata(&worktree.path).await?
+                            && metadata.is_dir
+                        {
+                            roots.push(app_state.fs.canonicalize(&worktree.path).await?);
+                        }
+                    }
+                    anyhow::ensure!(
+                        roots.contains(&path),
+                        "{} is not a worktree of its Git repository",
+                        path.display()
+                    );
+                    let candidates = cx.update(|cx| {
+                        cx.windows()
+                            .into_iter()
+                            .filter_map(|window| window.downcast::<MultiWorkspace>())
+                            .flat_map(|window| {
+                                window
+                                    .read(cx)
+                                    .map(|multi_workspace| {
+                                        multi_workspace
+                                            .workspaces()
+                                            .filter_map(|workspace| {
+                                                let project = workspace.read(cx).project().read(cx);
+                                                project.is_local().then(|| {
+                                                    let paths = project
+                                                        .repositories(cx)
+                                                        .values()
+                                                        .map(|repository| {
+                                                            repository
+                                                                .read(cx)
+                                                                .work_directory_abs_path
+                                                                .to_path_buf()
+                                                        })
+                                                        .collect::<Vec<_>>();
+                                                    (window, workspace.clone(), paths)
+                                                })
+                                            })
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .unwrap_or_default()
+                            })
+                            .collect::<Vec<_>>()
+                    });
+                    for (window, workspace, paths) in candidates {
+                        for project_path in paths {
+                            if app_state.fs.canonicalize(&project_path).await.is_ok_and(|path| roots.contains(&path)) {
+                                let switch = window.update(cx, |multi_workspace, window, cx| {
+                                    multi_workspace.activate(workspace.clone(), None, window, cx);
+                                    workspace.update(cx, |workspace, cx| {
+                                        workspace.switch_worktree_in_place(path.clone(), window, cx)
+                                    })
+                                })?;
+                                switch.await?;
+                                let switched = workspace.read_with(cx, |workspace, cx| {
+                                    workspace.project().read(cx).visible_worktrees(cx).next()
+                                        .is_some_and(|root| root.read(cx).abs_path().as_ref() == path)
+                                });
+                                anyhow::ensure!(switched, "worktree switch cancelled or deferred; try again when the window is ready");
+                                return Ok(());
+                            }
+                        }
+                    }
+                    anyhow::bail!(
+                        "no Zed window shows the Git repository for {}",
+                        path.display()
+                    );
+                }
+                .await;
+                let status = if let Err(error) = result {
+                    responses
+                        .send(CliResponse::Stderr {
+                            message: format!("{error:#}"),
+                        })
+                        .log_err();
+                    1
+                } else {
+                    0
+                };
+                responses.send(CliResponse::Exit { status }).log_err();
+            }
             CliRequest::Open {
                 urls,
                 paths,
@@ -1129,7 +1272,7 @@ mod tests {
     use cli::CliResponse;
     use editor::Editor;
     use futures::poll;
-    use gpui::{AppContext as _, TestAppContext, UpdateGlobal as _};
+    use gpui::{TestAppContext, UpdateGlobal as _};
     use language::LineEnding;
     use remote::SshConnectionOptions;
     use rope::Rope;
@@ -2537,6 +2680,110 @@ mod tests {
         cx.run_until_parked();
 
         (exit_status, prompt_shown)
+    }
+
+    #[gpui::test]
+    async fn test_cli_close_matches_canonical_project_root(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let fs = app_state.fs.as_fake();
+        fs.insert_tree(path!("/project"), json!({"child": {}}))
+            .await;
+        fs.insert_symlink(path!("/alias"), PathBuf::from(path!("/project")))
+            .await;
+        open_workspace_file(path!("/project"), Default::default(), app_state.clone(), cx).await;
+        let (status, _) = run_cli_with_zed_handler(
+            cx,
+            app_state.clone(),
+            CliRequest::Close {
+                path: PathBuf::from(path!("/project/child")),
+            },
+            None,
+        );
+        assert_eq!(status, 1);
+        assert_eq!(cx.windows().len(), 1);
+        let (status, _) = run_cli_with_zed_handler(
+            cx,
+            app_state,
+            CliRequest::Close {
+                path: PathBuf::from(path!("/alias")),
+            },
+            None,
+        );
+        assert_eq!(status, 0);
+        assert!(cx.windows().is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_cli_switch_worktree_matches_repository(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let fs = app_state.fs.as_fake();
+        fs.insert_tree(path!("/repo"), json!({".git": {}, "file.txt": ""}))
+            .await;
+        fs.add_linked_worktree_for_repo(
+            Path::new(path!("/repo/.git")),
+            true,
+            git::repository::Worktree {
+                path: PathBuf::from(path!("/linked")),
+                ref_name: Some("refs/heads/linked".into()),
+                sha: "0000000".into(),
+                is_main: false,
+                is_bare: false,
+            },
+        )
+        .await;
+        fs.insert_tree(path!("/other"), json!({".git": {}})).await;
+        open_workspace_file(path!("/repo"), Default::default(), app_state.clone(), cx).await;
+        cx.run_until_parked();
+        let window = cx.windows()[0].downcast::<MultiWorkspace>().unwrap();
+        let (status, _) = run_cli_with_zed_handler(
+            cx,
+            app_state.clone(),
+            CliRequest::SwitchWorktree {
+                path: PathBuf::from(path!("/linked")),
+            },
+            None,
+        );
+        assert_eq!(status, 0);
+        window
+            .read_with(cx, |mw, cx| {
+                let root = mw
+                    .workspace()
+                    .read(cx)
+                    .project()
+                    .read(cx)
+                    .visible_worktrees(cx)
+                    .next()
+                    .unwrap();
+                assert_eq!(
+                    root.read(cx).abs_path().as_ref(),
+                    Path::new(path!("/linked"))
+                );
+            })
+            .unwrap();
+        for path in [path!("/other"), path!("/repo/file.txt")] {
+            let (status, _) = run_cli_with_zed_handler(
+                cx,
+                app_state.clone(),
+                CliRequest::SwitchWorktree {
+                    path: PathBuf::from(path),
+                },
+                None,
+            );
+            assert_eq!(status, 1);
+        }
+        let (status, _) = run_cli_with_zed_handler(
+            cx,
+            app_state,
+            CliRequest::Close {
+                path: PathBuf::from(path!("/repo")),
+            },
+            None,
+        );
+        assert_eq!(
+            status, 0,
+            "closing still matches the anchored root after switching"
+        );
+        assert!(cx.windows().is_empty());
     }
 
     #[gpui::test]

@@ -54,6 +54,12 @@ pub enum CliBehaviorSetting {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum CliRequest {
+    Close {
+        path: PathBuf,
+    },
+    SwitchWorktree {
+        path: PathBuf,
+    },
     Open {
         paths: Vec<String>,
         urls: Vec<String>,
