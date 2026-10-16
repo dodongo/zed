@@ -216,12 +216,14 @@ fn should_apply_default_new_workspace_layout(
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct WindowStatus {
     emoji: String,
+    agents_running: bool,
 }
 
 impl Default for WindowStatus {
     fn default() -> Self {
         Self {
             emoji: "◯".to_string(),
+            agents_running: false,
         }
     }
 }
@@ -239,6 +241,7 @@ fn parse_window_status(contents: &str) -> WindowStatus {
     let Ok(file) = serde_json::from_str::<WindowStatusFile>(contents) else {
         return WindowStatus {
             emoji: "⚠️".to_string(),
+            agents_running: false,
         };
     };
 
@@ -251,6 +254,7 @@ fn parse_window_status(contents: &str) -> WindowStatus {
     };
     WindowStatus {
         emoji: emoji.to_string(),
+        agents_running: file.state.as_deref() == Some("running"),
     }
 }
 
@@ -6858,6 +6862,18 @@ impl Workspace {
         self.window_root.as_deref()
     }
 
+    /// The window's anchored project root, or its first project folder before
+    /// the window root has been initialized.
+    pub fn project_root(&self, cx: &App) -> Option<PathBuf> {
+        self.window_root.clone().or_else(|| {
+            self.project
+                .read(cx)
+                .visible_worktrees(cx)
+                .next()
+                .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+        })
+    }
+
     fn persist_window_root(&mut self, cx: &App) {
         if self.window_root_persisted {
             return;
@@ -12122,6 +12138,56 @@ pub async fn prepare_windows_to_quit(
     true
 }
 
+/// Closes a project window after its close prompts have been accepted.
+/// Returns false if the user cancels. App quit and restart use a separate path.
+pub async fn close_window(window: WindowHandle<MultiWorkspace>, cx: &mut AsyncApp) -> Result<bool> {
+    if !prepare_window_to_close(window, CloseIntent::CloseWindow, cx).await? {
+        return Ok(false);
+    }
+
+    flush_windows_serialization(&[window], cx).await;
+
+    let command = window.read_with(cx, |multi_workspace, cx| {
+        let command = WorkspaceSettings::get_global(cx)
+            .window_close_command
+            .as_ref()?;
+        let root = multi_workspace.workspace().read(cx).project_root(cx)?;
+        let Some((program, args)) = command
+            .split_first()
+            .filter(|(program, _)| !program.is_empty())
+        else {
+            log::error!("window_close_command must contain a nonempty executable");
+            return None;
+        };
+        let mut command = util::command::new_command(program);
+        command
+            .args(args)
+            .arg(root)
+            .stdin(util::command::Stdio::null())
+            .stdout(util::command::Stdio::null())
+            .stderr(util::command::Stdio::null())
+            .kill_on_drop(false);
+        Some(command)
+    })?;
+    if let Some(mut command) = command {
+        match cx.background_spawn(async move { command.spawn() }).await {
+            Ok(mut child) => {
+                cx.background_spawn(async move {
+                    match child.status().await {
+                        Ok(status) if status.success() => {}
+                        Ok(status) => log::error!("window close command exited with {status}"),
+                        Err(error) => log::error!("window close command failed: {error:#}"),
+                    }
+                })
+                .detach();
+            }
+            Err(error) => log::error!("window close command failed to start: {error:#}"),
+        }
+    }
+    window.update(cx, |_, window, _| window.remove_window())?;
+    Ok(true)
+}
+
 pub(crate) async fn prepare_window_to_close(
     window: WindowHandle<MultiWorkspace>,
     close_intent: CloseIntent,
@@ -12142,6 +12208,26 @@ pub(crate) async fn prepare_window_to_close(
     let Some((originally_active, workspaces)) = active_and_workspaces else {
         return Ok(true);
     };
+
+    let agents_running = cx.update(|cx| {
+        workspaces
+            .iter()
+            .any(|workspace| workspace.read(cx).window_status.agents_running)
+    });
+    if close_intent == CloseIntent::CloseWindow && agents_running {
+        let answer = window.update(cx, |_, window, cx| {
+            window.prompt(
+                PromptLevel::Warning,
+                "Agents are working in this window. Close it and stop them?",
+                None,
+                &["Close", "Cancel"],
+                cx,
+            )
+        })?;
+        if answer.await? != 0 {
+            return Ok(false);
+        }
+    }
 
     let mut prepared = anyhow::Ok(true);
     for workspace in workspaces {
@@ -13026,6 +13112,161 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(cx.document_path(), None);
+    }
+
+    #[test]
+    fn test_window_status_confirmation_decision() {
+        assert!(parse_window_status(r#"{"state":"running"}"#).agents_running);
+        for status in [
+            "",
+            "not json",
+            "{}",
+            r#"{"state":"idle"}"#,
+            r#"{"state":"success"}"#,
+            r#"{"state":"failure"}"#,
+            r#"{"state":"unknown"}"#,
+        ] {
+            assert!(!parse_window_status(status).agents_running, "{status}");
+        }
+    }
+
+    #[gpui::test]
+    async fn test_project_root_prefers_anchor_then_first_worktree(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({"first": {}, "second": {}, "anchor": {}}),
+        )
+        .await;
+        let project = Project::test(
+            fs,
+            [
+                path!("/root/first").as_ref(),
+                path!("/root/second").as_ref(),
+            ],
+            cx,
+        )
+        .await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        workspace.update(cx, |workspace, cx| {
+            workspace.window_root = None;
+            assert_eq!(
+                workspace.project_root(cx),
+                Some(PathBuf::from(path!("/root/first")))
+            );
+            workspace.window_root = Some(PathBuf::from(path!("/root/anchor")));
+            assert_eq!(
+                workspace.project_root(cx),
+                Some(PathBuf::from(path!("/root/anchor")))
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_running_agents_confirm_close_but_not_quit(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({".zed": {"window-status.json": r#"{"state":"running"}"#}}),
+        )
+        .await;
+        let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        cx.run_until_parked();
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.window_status.agents_running)
+        });
+
+        let closing = cx.spawn(|mut cx| async move { close_window(window, &mut cx).await });
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Cancel");
+        assert!(!closing.await.unwrap());
+        assert!(window.read_with(cx, |_, _| ()).is_ok());
+        assert!(!workspace.read_with(cx, |workspace, _| workspace.removing));
+
+        let quitting = cx.spawn(|mut cx| async move {
+            prepare_window_to_close(window, CloseIntent::Quit, &mut cx).await
+        });
+        assert!(quitting.await.unwrap());
+        assert!(!cx.has_pending_prompt());
+        assert!(window.read_with(cx, |_, _| ()).is_ok());
+
+        let closing = cx.spawn(|mut cx| async move { close_window(window, &mut cx).await });
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Close");
+        assert!(closing.await.unwrap());
+        assert!(window.read_with(cx, |_, _| ()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_window_close_command_only_runs_after_accepted_window_close(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.executor().allow_parking();
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let output_path = output.path().to_path_buf();
+        cx.update_global(|store: &mut SettingsStore, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.workspace.window_close_command = Some(vec![
+                    "sh".into(),
+                    "-c".into(),
+                    r#"printf "%s\n%s" "$1" "$2" > "$0""#.into(),
+                    output_path.to_string_lossy().into_owned(),
+                    "--label=hello world".into(),
+                ]);
+            });
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project root/$(literal)"),
+            json!({".zed": {"window-status.json": r#"{"state":"running"}"#}}),
+        )
+        .await;
+        let project = Project::test(fs, [path!("/project root/$(literal)").as_ref()], cx).await;
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        cx.run_until_parked();
+
+        assert!(
+            cx.spawn(|mut cx| async move {
+                prepare_window_to_close(window, CloseIntent::Quit, &mut cx).await
+            })
+            .await
+            .unwrap()
+        );
+        cx.run_until_parked();
+        assert_eq!(std::fs::read_to_string(output.path()).unwrap(), "");
+
+        let close = cx.spawn(|mut cx| async move { close_window(window, &mut cx).await });
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Cancel");
+        assert!(!close.await.unwrap());
+        cx.run_until_parked();
+        assert_eq!(std::fs::read_to_string(output.path()).unwrap(), "");
+
+        let close = cx.spawn(|mut cx| async move { close_window(window, &mut cx).await });
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Close");
+        assert!(close.await.unwrap());
+        for _ in 0..1000 {
+            cx.run_until_parked();
+            if std::fs::read_to_string(output.path()).unwrap()
+                == "--label=hello world\n/project root/$(literal)"
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("window close command did not receive the project root");
     }
 
     #[gpui::test]

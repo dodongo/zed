@@ -34,6 +34,7 @@ pub struct WorkspaceSettings {
     pub max_tabs: Option<NonZeroUsize>,
     pub when_closing_with_no_tabs: settings::CloseWindowWhenNoItems,
     pub on_last_window_closed: settings::OnLastWindowClosed,
+    pub window_close_command: Option<Vec<String>>,
     pub text_rendering_mode: settings::TextRenderingMode,
     pub resize_all_panels_in_dock: Vec<DockPosition>,
     pub close_on_file_delete: bool,
@@ -131,6 +132,7 @@ impl Settings for WorkspaceSettings {
             max_tabs: workspace.max_tabs,
             when_closing_with_no_tabs: workspace.when_closing_with_no_tabs.unwrap(),
             on_last_window_closed: workspace.on_last_window_closed.unwrap(),
+            window_close_command: workspace.window_close_command.clone(),
             text_rendering_mode: workspace.text_rendering_mode.unwrap(),
             resize_all_panels_in_dock: workspace
                 .resize_all_panels_in_dock

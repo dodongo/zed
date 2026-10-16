@@ -113,6 +113,11 @@ pub struct WorkspaceSettingsContent {
     ///
     /// Default: auto (nothing on macOS, "app quit" otherwise)
     pub on_last_window_closed: Option<OnLastWindowClosed>,
+    /// Command to run when a window closes, with its project root appended as
+    /// the last argument. Runs detached, not when quitting or restarting Zed.
+    ///
+    /// Default: none
+    pub window_close_command: Option<Vec<String>>,
     /// Whether to resize all the panels in a dock when resizing the dock.
     ///
     /// Default: ["left"]

@@ -558,20 +558,9 @@ impl MultiWorkspace {
             return;
         };
         cx.spawn(async move |_, cx| {
-            if !crate::prepare_window_to_close(window_handle, CloseIntent::CloseWindow, cx)
+            crate::close_window(window_handle, cx)
                 .await
-                .context("preparing the window to close")?
-            {
-                return anyhow::Ok(());
-            }
-
-            crate::flush_windows_serialization(&[window_handle], cx).await;
-
-            window_handle
-                .update(cx, |_, window, _cx| {
-                    window.remove_window();
-                })
-                .context("removing the closed window")?;
+                .context("closing the window")?;
 
             anyhow::Ok(())
         })

@@ -1063,6 +1063,7 @@ impl VsCodeSettings {
                 None
             },
             on_last_window_closed: None,
+            window_close_command: None,
             pane_split_direction_horizontal: None,
             pane_split_direction_vertical: None,
             resize_all_panels_in_dock: None,
