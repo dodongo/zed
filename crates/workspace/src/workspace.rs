@@ -12159,7 +12159,11 @@ pub async fn close_window(window: WindowHandle<MultiWorkspace>, cx: &mut AsyncAp
             log::error!("window_close_command must contain a nonempty executable");
             return None;
         };
-        let mut command = util::command::new_command(program);
+        let program = match program.strip_prefix("~/") {
+            Some(relative) => util::paths::home_dir().join(relative),
+            None => PathBuf::from(program),
+        };
+        let mut command = util::command::new_command(&program);
         command
             .args(args)
             .arg(root)
