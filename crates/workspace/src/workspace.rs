@@ -11246,6 +11246,61 @@ pub async fn find_existing_workspace(
     (existing, open_visible)
 }
 
+/// The local workspace whose project root or project folder is the single
+/// requested folder. Each folder is shown by at most one window, whatever the
+/// open options ask for.
+async fn workspace_showing_folder(
+    abs_paths: &[PathBuf],
+    app_state: &AppState,
+    cx: &mut AsyncApp,
+) -> Option<(WindowHandle<MultiWorkspace>, Entity<Workspace>)> {
+    let [path] = abs_paths else {
+        return None;
+    };
+    if !app_state.fs.is_dir(path).await {
+        return None;
+    }
+    let path = app_state.fs.canonicalize(path).await.ok()?;
+    let candidates = cx.update(|cx| {
+        let mut candidates = Vec::new();
+        for window in workspace_windows_for_location(&SerializedWorkspaceLocation::Local, cx) {
+            let Ok(multi_workspace) = window.read(cx) else {
+                continue;
+            };
+            for workspace in multi_workspace.workspaces() {
+                let roots = workspace
+                    .read(cx)
+                    .project_root(cx)
+                    .into_iter()
+                    .chain(
+                        workspace
+                            .read(cx)
+                            .project
+                            .read(cx)
+                            .visible_worktrees(cx)
+                            .map(|worktree| worktree.read(cx).abs_path().to_path_buf()),
+                    )
+                    .collect::<Vec<_>>();
+                candidates.push((window, workspace.clone(), roots));
+            }
+        }
+        candidates
+    });
+    for (window, workspace, roots) in candidates {
+        for root in roots {
+            if app_state
+                .fs
+                .canonicalize(&root)
+                .await
+                .is_ok_and(|root| root == path)
+            {
+                return Some((window, workspace));
+            }
+        }
+    }
+    None
+}
+
 /// Controls whether to reuse an existing workspace whose worktrees contain the
 /// given paths, and how broadly to match.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -11446,13 +11501,19 @@ pub fn open_paths(
         .find_map(|p| util::paths::WslPath::from_path(p));
 
     cx.spawn(async move |cx| {
-        let (mut existing, mut open_visible) = find_existing_workspace(
-            &abs_paths,
-            &open_options,
-            &SerializedWorkspaceLocation::Local,
-            cx,
-        )
-        .await;
+        let (mut existing, mut open_visible) =
+            match workspace_showing_folder(&abs_paths, &app_state, cx).await {
+                Some(found) => (Some(found), OpenVisible::All),
+                None => {
+                    find_existing_workspace(
+                        &abs_paths,
+                        &open_options,
+                        &SerializedWorkspaceLocation::Local,
+                        cx,
+                    )
+                    .await
+                }
+            };
 
         // Fallback: if no workspace contains the paths and all paths are files,
         // prefer an existing local workspace window (active window first).

@@ -3032,7 +3032,9 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_e2e_new_window_setting_opens_project_root_in_new_window(cx: &mut TestAppContext) {
+    async fn test_e2e_new_window_setting_focuses_the_window_showing_the_project_root(
+        cx: &mut TestAppContext,
+    ) {
         let app_state = init_test(cx);
 
         app_state
@@ -3079,7 +3081,7 @@ mod tests {
             !prompt_shown,
             "no prompt should be shown when setting already configured"
         );
-        assert_eq!(cx.windows().len(), 2);
+        assert_eq!(cx.windows().len(), 1);
     }
 
     #[gpui::test]
@@ -3227,6 +3229,38 @@ mod tests {
         assert_eq!(status, 0);
         assert!(!prompt_shown, "no prompt should be shown with -n flag");
         assert_eq!(cx.windows().len(), 2);
+    }
+
+    #[gpui::test]
+    async fn test_e2e_new_flag_focuses_the_window_already_showing_the_folder(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = init_test(cx);
+
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(path!("/project"), json!({ "file.txt": "content" }))
+            .await;
+
+        open_workspace_file(path!("/project"), Default::default(), app_state.clone(), cx).await;
+        assert_eq!(cx.windows().len(), 1);
+
+        for behavior in [
+            cli::OpenBehavior::AlwaysNew,
+            cli::OpenBehavior::Classic,
+            cli::OpenBehavior::Reuse,
+            cli::OpenBehavior::Default,
+        ] {
+            let (status, _) = run_cli_with_zed_handler(
+                cx,
+                app_state.clone(),
+                make_cli_open_request(vec![path!("/project").to_string()], behavior),
+                None,
+            );
+            assert_eq!(status, 0);
+            assert_eq!(cx.windows().len(), 1, "{behavior:?} opened a second window");
+        }
     }
 
     #[gpui::test]
