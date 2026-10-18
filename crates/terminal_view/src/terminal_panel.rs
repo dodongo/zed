@@ -1257,9 +1257,10 @@ impl TerminalPanel {
     }
 
     /// Shows the terminals of the window's most recently displayed other
-    /// workspace that has any, so switching workspaces in a window keeps its
-    /// terminal sessions instead of starting new ones. Returns whether it
-    /// added any.
+    /// workspace of the same repository that has any, so switching worktrees
+    /// in a window keeps its terminal sessions instead of starting new ones.
+    /// A workspace of another repository starts its own terminals. Returns
+    /// whether it added any.
     fn share_window_terminals(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(workspace) = self.workspace.upgrade() else {
             return false;
@@ -1267,10 +1268,12 @@ impl TerminalPanel {
         let Some(multi_workspace) = window.root::<MultiWorkspace>().flatten() else {
             return false;
         };
+        let repository = workspace.read(cx).project_group_key(cx);
         let source = multi_workspace
             .read(cx)
             .other_workspaces_by_recency(&workspace)
             .into_iter()
+            .filter(|other| other.read(cx).project_group_key(cx).matches(&repository))
             .find_map(|other| {
                 let pane = other
                     .read(cx)
@@ -2088,6 +2091,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use project::FakeFs;
     use settings::SettingsStore;
+    use util::path;
     use workspace::{MultiWorkspace, WorkspaceId};
 
     #[test]
@@ -3147,8 +3151,13 @@ mod tests {
             .expect("Failed to read configured terminal panel starts_open");
     }
 
-    #[gpui::test]
-    async fn test_another_workspace_in_the_window_shows_the_same_terminal(cx: &mut TestAppContext) {
+    /// Starts a terminal in the window's first workspace, then activates the
+    /// terminal panel of a second workspace with `second_paths`, and returns
+    /// both panels' terminals.
+    async fn terminals_after_adding_workspace(
+        second_paths: &[&str],
+        cx: &mut TestAppContext,
+    ) -> (Vec<EntityId>, Vec<EntityId>) {
         cx.executor().allow_parking();
         init_test(cx);
 
@@ -3166,19 +3175,25 @@ mod tests {
             })
             .unwrap();
         cx.run_until_parked();
-        let first_terminals = first_panel.read_with(cx, |panel, cx| {
-            panel
-                .active_pane
-                .read(cx)
-                .items()
-                .filter_map(|item| item.downcast::<TerminalView>())
-                .map(|view| view.read(cx).terminal().entity_id())
-                .collect::<Vec<_>>()
-        });
+        let terminals = |panel: &Entity<TerminalPanel>, cx: &mut TestAppContext| {
+            panel.read_with(cx, |panel, cx| {
+                panel
+                    .active_pane
+                    .read(cx)
+                    .items()
+                    .filter_map(|item| item.downcast::<TerminalView>())
+                    .map(|view| view.read(cx).terminal().entity_id())
+                    .collect::<Vec<_>>()
+            })
+        };
+        let first_terminals = terminals(&first_panel, cx);
         assert_eq!(first_terminals.len(), 1);
 
         let fs = FakeFs::new(cx.executor());
-        let project = Project::test(fs, [], cx).await;
+        for path in second_paths {
+            fs.insert_tree(path, serde_json::json!({})).await;
+        }
+        let project = Project::test(fs, second_paths.iter().map(std::path::Path::new), cx).await;
         let second_panel = window_handle
             .update(cx, |multi_workspace, window, cx| {
                 let workspace = multi_workspace.test_add_workspace(project, window, cx);
@@ -3196,16 +3211,21 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
 
-        let second_terminals = second_panel.read_with(cx, |panel, cx| {
-            panel
-                .active_pane
-                .read(cx)
-                .items()
-                .filter_map(|item| item.downcast::<TerminalView>())
-                .map(|view| view.read(cx).terminal().entity_id())
-                .collect::<Vec<_>>()
-        });
-        assert_eq!(second_terminals, first_terminals);
+        (first_terminals, terminals(&second_panel, cx))
+    }
+
+    #[gpui::test]
+    async fn test_another_workspace_in_the_window_shows_the_same_terminal(cx: &mut TestAppContext) {
+        let (first, second) = terminals_after_adding_workspace(&[], cx).await;
+        assert_eq!(second, first);
+    }
+
+    #[gpui::test]
+    async fn test_another_repository_in_the_window_starts_its_own_terminal(
+        cx: &mut TestAppContext,
+    ) {
+        let (first, second) = terminals_after_adding_workspace(&[path!("/other")], cx).await;
+        assert!(!second.contains(&first[0]), "{second:?} reused {first:?}");
     }
 
     #[gpui::test]
