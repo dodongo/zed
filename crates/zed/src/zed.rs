@@ -197,6 +197,30 @@ pub fn init(cx: &mut App) {
     #[cfg(target_os = "macos")]
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
     cx.on_action(quit);
+    // Restarting tools send SIGTERM; quit through the Quit action so windows are saved first.
+    #[cfg(target_os = "macos")]
+    match signal_hook::iterator::Signals::new([signal_hook::consts::SIGTERM]) {
+        Ok(mut signals) => {
+            let (sender, mut receiver) = mpsc::unbounded();
+            std::thread::Builder::new()
+                .name("sigterm-quit".into())
+                .spawn(move || {
+                    for _ in signals.forever() {
+                        if sender.unbounded_send(()).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .log_err();
+            cx.spawn(async move |cx| {
+                while receiver.next().await.is_some() {
+                    cx.update(|cx| cx.dispatch_action(&Quit));
+                }
+            })
+            .detach();
+        }
+        Err(error) => log::error!("failed to listen for SIGTERM: {error}"),
+    }
 
     cx.on_action(|_: &RestoreBanner, cx| title_bar::restore_banner(cx));
 
