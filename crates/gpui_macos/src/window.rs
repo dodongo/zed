@@ -1183,40 +1183,45 @@ impl MacWindow {
                 }
             }
 
-            if allows_automatic_window_tabbing
-                && !main_window.is_null()
-                && main_window != native_window
-            {
-                let main_window_is_fullscreen = main_window
+            let tab_group_window = if allows_automatic_window_tabbing {
+                tab_group_window(app, main_window, native_window)
+            } else {
+                None
+            };
+            if let Some(tab_group_window) = tab_group_window {
+                let tab_group_window_is_fullscreen = tab_group_window
                     .styleMask()
                     .contains(NSWindowStyleMask::NSFullScreenWindowMask);
                 let user_tabbing_preference = Self::get_user_tabbing_preference()
                     .unwrap_or(UserTabbingPreference::InFullScreen);
                 let should_add_as_tab = user_tabbing_preference == UserTabbingPreference::Always
                     || user_tabbing_preference == UserTabbingPreference::InFullScreen
-                        && main_window_is_fullscreen;
+                        && tab_group_window_is_fullscreen;
 
                 if should_add_as_tab {
-                    let main_window_can_tab: BOOL =
-                        msg_send![main_window, respondsToSelector: sel!(addTabbedWindow:ordered:)];
-                    let main_window_visible: BOOL = msg_send![main_window, isVisible];
+                    let tab_group_window_can_tab: BOOL = msg_send![tab_group_window, respondsToSelector: sel!(addTabbedWindow:ordered:)];
+                    let tab_group_window_visible: BOOL = msg_send![tab_group_window, isVisible];
 
-                    if main_window_can_tab == YES && main_window_visible == YES {
+                    if tab_group_window_can_tab == YES && tab_group_window_visible == YES {
                         // Append after the group's last tab rather than after the main
                         // window, so tabs keep their opening order however focus moves
                         // while windows open, as during session restore.
-                        let tabbed_windows: id = msg_send![main_window, tabbedWindows];
+                        let tabbed_windows: id = msg_send![tab_group_window, tabbedWindows];
                         let last_tab: id = if tabbed_windows.is_null() {
                             nil
                         } else {
                             msg_send![tabbed_windows, lastObject]
                         };
-                        let anchor = if last_tab.is_null() { main_window } else { last_tab };
+                        let anchor = if last_tab.is_null() {
+                            tab_group_window
+                        } else {
+                            last_tab
+                        };
                         let _: () = msg_send![anchor, addTabbedWindow: native_window ordered: NSWindowOrderingMode::NSWindowAbove];
 
                         // Ensure the window is visible immediately after adding the tab, since the tab bar is updated with a new entry at this point.
                         // Note: Calling orderFront here can break fullscreen mode (makes fullscreen windows exit fullscreen), so only do this if the main window is not fullscreen.
-                        if !main_window_is_fullscreen {
+                        if !tab_group_window_is_fullscreen {
                             let _: () = msg_send![native_window, orderFront: nil];
                         }
                     }
@@ -2245,6 +2250,37 @@ fn get_scale_factor(native_window: id) -> f32 {
     // it was rendered for real.
     // Regardless, attempt to avoid the issue here.
     if factor == 0.0 { 2. } else { factor }
+}
+
+/// Returns the window whose tab group a new window should join. An inactive app has no main
+/// window, as when macOS opens Zed at login, so fall back to the frontmost visible GPUI window
+/// with the same tabbing identifier.
+unsafe fn tab_group_window(app: id, main_window: id, native_window: id) -> Option<id> {
+    unsafe {
+        if !main_window.is_null() {
+            return (main_window != native_window).then_some(main_window);
+        }
+        let tabbing_identifier: id = msg_send![native_window, tabbingIdentifier];
+        if tabbing_identifier.is_null() {
+            return None;
+        }
+        let windows: id = msg_send![app, orderedWindows];
+        let count: usize = msg_send![windows, count];
+        (0..count)
+            .map(|index| -> id { msg_send![windows, objectAtIndex: index] })
+            .find(|&window| {
+                if window == native_window || !is_gpui_window(window) {
+                    return false;
+                }
+                let visible: BOOL = msg_send![window, isVisible];
+                let window_tabbing_identifier: id = msg_send![window, tabbingIdentifier];
+                visible == YES && !window_tabbing_identifier.is_null() && {
+                    let same_group: BOOL =
+                        msg_send![window_tabbing_identifier, isEqualToString: tabbing_identifier];
+                    same_group == YES
+                }
+            })
+    }
 }
 
 /// Returns whether `window` is one of GPUI's managed windows.
